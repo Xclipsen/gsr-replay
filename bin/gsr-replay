@@ -1,0 +1,1133 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly VERSION="1.0.0"
+readonly SERVICE_NAME="gsr-replay.service"
+readonly CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+readonly CONFIG_DIR="$CONFIG_HOME/gsr-replay"
+readonly CONFIG_FILE="$CONFIG_DIR/config"
+CLI_PATH="$(realpath "${BASH_SOURCE[0]}")"
+readonly CLI_PATH
+if [[ "$CLI_PATH" == /usr/bin/* ]]; then
+  readonly SERVICE_PATH="/usr/lib/systemd/user/$SERVICE_NAME"
+  readonly CALLBACK_PATH="/usr/lib/gsr-replay/gsr-replay-callback"
+  readonly REINSTALL_HINT="Reinstall the gsr-replay package."
+else
+  readonly SERVICE_PATH="$CONFIG_HOME/systemd/user/$SERVICE_NAME"
+  readonly CALLBACK_PATH="$HOME/.local/bin/gsr-replay-callback"
+  readonly REINSTALL_HINT="Re-run install.sh."
+fi
+readonly WAYBAR_MODULE_PATH="$CONFIG_DIR/waybar.jsonc"
+readonly WAYBAR_MANIFEST_PATH="$CONFIG_DIR/waybar-install"
+readonly MAX_RAM_BUFFER_MIB=8192
+
+main() {
+  local command="${1:-help}"
+  shift || true
+
+  case "$command" in
+    setup) setup "$@" ;;
+    start | stop | restart) service_command "$command" ;;
+    toggle) toggle ;;
+    save) save_replay ;;
+    status) status ;;
+    doctor) doctor ;;
+    config) show_config ;;
+    run) run_recorder ;;
+    saved) replay_saved "$@" ;;
+    waybar) waybar_status ;;
+    waybar-install) waybar_install_command "$@" ;;
+    waybar-uninstall) waybar_uninstall_command "$@" ;;
+    list-monitors) list_monitors ;;
+    list-audio) list_audio ;;
+    -v | --version | version) printf 'gsr-replay %s\n' "$VERSION" ;;
+    -h | --help | help) usage ;;
+    *) die "Unknown command: $command. Run 'gsr-replay help' for usage." ;;
+  esac
+}
+
+usage() {
+  cat <<'EOF'
+GSR Replay - instant replay management for GPU Screen Recorder
+
+Usage: gsr-replay <command>
+
+Commands:
+  setup              Run the interactive onboarding wizard
+  start              Start the replay buffer
+  stop               Stop the replay buffer
+  restart            Restart the replay buffer
+  toggle              Start or stop the replay buffer
+  save                Save the current replay buffer
+  status              Show service and recording configuration
+  doctor              Check dependencies and configuration
+  config              Print the configuration file
+  list-monitors       List capture displays
+  list-audio          List audio sources
+  waybar              Print Waybar module status as JSON
+  waybar-install      Install the Waybar integration
+  waybar-uninstall    Remove the Waybar integration
+  version             Print the installed version
+  help                Show this help
+
+Run 'gsr-replay setup' after installation to configure your first replay.
+EOF
+}
+
+set_defaults() {
+  GSR_REPLAY_MONITOR="${GSR_REPLAY_MONITOR:-screen}"
+  GSR_REPLAY_RESOLUTION="${GSR_REPLAY_RESOLUTION:-1920x1080}"
+  GSR_REPLAY_FPS="${GSR_REPLAY_FPS:-30}"
+  GSR_REPLAY_SECONDS="${GSR_REPLAY_SECONDS:-360}"
+  GSR_REPLAY_AUDIO="${GSR_REPLAY_AUDIO:-default_output}"
+  GSR_REPLAY_BITRATE="${GSR_REPLAY_BITRATE:-15000}"
+  GSR_REPLAY_CODEC="${GSR_REPLAY_CODEC:-auto}"
+  GSR_REPLAY_STORAGE="${GSR_REPLAY_STORAGE:-ram}"
+  GSR_REPLAY_DIR="${GSR_REPLAY_DIR:-$(default_output_dir)}"
+  GSR_REPLAY_NOTIFICATIONS="${GSR_REPLAY_NOTIFICATIONS:-true}"
+  GSR_REPLAY_WAYBAR_CONFIG="${GSR_REPLAY_WAYBAR_CONFIG:-}"
+  GSR_REPLAY_WAYBAR_STYLE="${GSR_REPLAY_WAYBAR_STYLE:-}"
+  GSR_REPLAY_WAYBAR_POSITION="${GSR_REPLAY_WAYBAR_POSITION:-right}"
+  GSR_REPLAY_WAYBAR_ENABLED="${GSR_REPLAY_WAYBAR_ENABLED:-false}"
+}
+
+load_config() {
+  set_defaults
+  if [[ -f "$CONFIG_FILE" ]]; then
+    local key value
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
+      [[ -z "$key" || "$key" == \#* ]] && continue
+      case "$key" in
+        GSR_REPLAY_MONITOR | GSR_REPLAY_RESOLUTION | GSR_REPLAY_FPS | GSR_REPLAY_SECONDS | GSR_REPLAY_AUDIO | GSR_REPLAY_BITRATE | GSR_REPLAY_CODEC | GSR_REPLAY_STORAGE | GSR_REPLAY_DIR | GSR_REPLAY_NOTIFICATIONS | GSR_REPLAY_WAYBAR_CONFIG | GSR_REPLAY_WAYBAR_STYLE | GSR_REPLAY_WAYBAR_POSITION | GSR_REPLAY_WAYBAR_ENABLED)
+          printf -v "$key" '%s' "$value"
+          ;;
+        *) die "Unknown setting in $CONFIG_FILE: $key" ;;
+      esac
+    done < "$CONFIG_FILE"
+  fi
+  GSR_REPLAY_DIR="$(expand_home "$GSR_REPLAY_DIR")"
+}
+
+default_output_dir() {
+  local videos=""
+  if command -v xdg-user-dir >/dev/null 2>&1; then
+    videos="$(xdg-user-dir VIDEOS 2>/dev/null || true)"
+  fi
+  printf '%s/replay\n' "${videos:-$HOME/Videos}"
+}
+
+expand_home() {
+  if [[ "$1" == "~" ]]; then
+    printf '%s\n' "$HOME"
+  elif [[ "${1:0:2}" == \~/ ]]; then
+    printf '%s/%s\n' "$HOME" "${1:2}"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+validate_config() {
+  validate_text "Capture display" "$GSR_REPLAY_MONITOR"
+  [[ -n "$GSR_REPLAY_MONITOR" ]] || die "Capture display cannot be empty."
+  [[ "$GSR_REPLAY_RESOLUTION" =~ ^[0-9]+x[0-9]+$ ]] || die "Resolution must look like 1920x1080."
+  validate_integer "Frame rate" "$GSR_REPLAY_FPS" 1 240
+  validate_integer "Replay duration" "$GSR_REPLAY_SECONDS" 2 86400
+  validate_integer "Video bitrate" "$GSR_REPLAY_BITRATE" 500 200000
+  [[ "$GSR_REPLAY_CODEC" =~ ^(auto|h264|hevc|av1|vp8|vp9|hevc_hdr|av1_hdr|hevc_10bit|av1_10bit)$ ]] || die "Unsupported video codec: $GSR_REPLAY_CODEC"
+  [[ "$GSR_REPLAY_STORAGE" == "ram" || "$GSR_REPLAY_STORAGE" == "disk" ]] || die "Replay storage must be ram or disk."
+  [[ "$GSR_REPLAY_NOTIFICATIONS" == "true" || "$GSR_REPLAY_NOTIFICATIONS" == "false" ]] || die "Notifications must be true or false."
+  [[ "$GSR_REPLAY_WAYBAR_ENABLED" == "true" || "$GSR_REPLAY_WAYBAR_ENABLED" == "false" ]] || die "Waybar integration must be true or false."
+  [[ -n "$GSR_REPLAY_DIR" ]] || die "Replay output directory cannot be empty."
+  [[ "$GSR_REPLAY_DIR" == /* ]] || die "Replay output directory must be an absolute path."
+  validate_text "Audio source" "$GSR_REPLAY_AUDIO"
+  validate_text "Replay output directory" "$GSR_REPLAY_DIR"
+  if [[ "$GSR_REPLAY_STORAGE" == "ram" ]] && (( $(estimated_buffer_mib) > MAX_RAM_BUFFER_MIB )); then
+    die "The estimated RAM buffer exceeds ${MAX_RAM_BUFFER_MIB} MiB. Choose disk storage or lower the duration/bitrate."
+  fi
+}
+
+validate_integer() {
+  local label="$1" value="$2" minimum="$3" maximum="$4"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "$label must be an integer."
+  ((${#value} <= ${#maximum})) || die "$label must be between $minimum and $maximum."
+  ((10#$value >= minimum && 10#$value <= maximum)) || die "$label must be between $minimum and $maximum."
+}
+
+validate_text() {
+  local label="$1" value="$2"
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* && "$value" != *$'\t'* ]] || die "$label contains unsupported control characters."
+}
+
+prepare_output_dir() {
+  if [[ -L "$GSR_REPLAY_DIR" && ! -e "$GSR_REPLAY_DIR" ]]; then
+    die "Replay output is unavailable: $GSR_REPLAY_DIR points to a missing target."
+  fi
+  mkdir -p "$GSR_REPLAY_DIR"
+  [[ -d "$GSR_REPLAY_DIR" && -w "$GSR_REPLAY_DIR" ]] || die "Replay output is not writable: $GSR_REPLAY_DIR"
+}
+
+run_recorder() {
+  load_config
+  validate_config
+  require_command gpu-screen-recorder
+  prepare_output_dir
+  [[ -x "$CALLBACK_PATH" ]] || die "Replay callback is missing. $REINSTALL_HINT"
+
+  local -a args=(
+    -w "$GSR_REPLAY_MONITOR"
+    -s "$GSR_REPLAY_RESOLUTION"
+    -f "$GSR_REPLAY_FPS"
+    -c mp4
+    -r "$GSR_REPLAY_SECONDS"
+    -replay-storage "$GSR_REPLAY_STORAGE"
+    -bm cbr
+    -q "$GSR_REPLAY_BITRATE"
+    -k "$GSR_REPLAY_CODEC"
+    -fm cfr
+    -fallback-cpu-encoding yes
+    -sc "$CALLBACK_PATH"
+    -o "$GSR_REPLAY_DIR"
+  )
+  if [[ "$GSR_REPLAY_MONITOR" == "portal" ]]; then
+    args+=( -restore-portal-session yes )
+  fi
+  if [[ "$GSR_REPLAY_AUDIO" != "none" ]]; then
+    args+=( -a "$GSR_REPLAY_AUDIO" )
+  fi
+
+  exec gpu-screen-recorder "${args[@]}"
+}
+
+replay_saved() {
+  local file="${1:-}"
+  load_config
+  [[ -n "$file" && -f "$file" ]] || return 0
+  notify "Replay clip saved" "$file" normal 7000
+}
+
+save_replay() {
+  load_config
+  validate_config
+  prepare_output_dir
+  require_command systemctl
+
+  if ! service_active; then
+    notify "Replay buffer is starting" "Try saving again in a moment." normal 5000
+    systemctl --user start "$SERVICE_NAME"
+    die "Replay buffer was not running. It has been started; try again in a moment."
+  fi
+
+  notify "Saving replay clip" "Saving the last $(format_duration "$GSR_REPLAY_SECONDS")." normal 2500
+  systemctl --user kill --kill-whom=main --signal=SIGUSR1 "$SERVICE_NAME"
+  printf 'Replay save requested.\n'
+}
+
+service_command() {
+  local action="$1"
+  require_command systemctl
+  [[ -f "$SERVICE_PATH" ]] || die "The user service is not installed. $REINSTALL_HINT"
+  systemctl --user "$action" "$SERVICE_NAME"
+  printf 'Replay buffer %s.\n' "$(past_tense "$action")"
+}
+
+toggle() {
+  if service_active; then
+    service_command stop
+  else
+    service_command start
+  fi
+}
+
+service_active() {
+  command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet "$SERVICE_NAME"
+}
+
+past_tense() {
+  case "$1" in
+    start) printf 'started' ;;
+    stop) printf 'stopped' ;;
+    restart) printf 'restarted' ;;
+  esac
+}
+
+status() {
+  load_config
+  if ! (validate_config >/dev/null 2>&1); then
+    printf 'Replay buffer: configuration error\n'
+    printf 'Run "gsr-replay setup" to repair the configuration.\n'
+    return 1
+  fi
+  local state="inactive"
+  if service_active; then
+    state="active"
+  elif command -v systemctl >/dev/null 2>&1 && systemctl --user is-failed --quiet "$SERVICE_NAME"; then
+    state="failed"
+  fi
+
+  printf 'Replay buffer: %s\n' "$state"
+  printf 'Display:       %s\n' "$GSR_REPLAY_MONITOR"
+  printf 'Resolution:    %s at %s FPS\n' "$GSR_REPLAY_RESOLUTION" "$GSR_REPLAY_FPS"
+  printf 'Duration:      %s\n' "$(format_duration "$GSR_REPLAY_SECONDS")"
+  printf 'Audio:         %s\n' "$GSR_REPLAY_AUDIO"
+  printf 'Output:        %s\n' "$GSR_REPLAY_DIR"
+  printf 'Storage:       %s\n' "$GSR_REPLAY_STORAGE"
+}
+
+show_config() {
+  [[ -f "$CONFIG_FILE" ]] || die "No configuration found. Run 'gsr-replay setup'."
+  printf '%s\n' "$CONFIG_FILE"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    printf '%s\n' "$line"
+  done < "$CONFIG_FILE"
+}
+
+doctor() {
+  load_config
+  local errors=0 monitor_found=false
+
+  check_command gpu-screen-recorder true || ((errors += 1))
+  check_command systemctl true || ((errors += 1))
+  check_command notify-send false || true
+  check_command waybar false || true
+
+  if [[ -f "$CONFIG_FILE" ]]; then
+    check_ok "Configuration" "$CONFIG_FILE"
+    if ! (validate_config >/dev/null 2>&1); then
+      check_error "Configuration" "Invalid values. Run 'gsr-replay setup' again."
+      ((errors += 1))
+    fi
+  else
+    check_error "Configuration" "Missing. Run 'gsr-replay setup'."
+    ((errors += 1))
+  fi
+
+  if [[ -f "$SERVICE_PATH" ]]; then
+    check_ok "User service" "$SERVICE_PATH"
+  else
+    check_error "User service" "Missing. $REINSTALL_HINT"
+    ((errors += 1))
+  fi
+
+  if [[ -x "$CALLBACK_PATH" ]]; then
+    check_ok "Replay callback" "$CALLBACK_PATH"
+  else
+    check_error "Replay callback" "Missing. $REINSTALL_HINT"
+    ((errors += 1))
+  fi
+
+  if [[ "$GSR_REPLAY_MONITOR" == "portal" ]]; then
+    check_ok "Capture display" "Portal selection"
+  elif command -v gpu-screen-recorder >/dev/null 2>&1; then
+    while IFS='|' read -r name _; do
+      [[ "$name" == "$GSR_REPLAY_MONITOR" ]] && monitor_found=true
+    done < <(gpu-screen-recorder --list-monitors 2>/dev/null || true)
+    if [[ "$monitor_found" == "true" ]]; then
+      check_ok "Capture display" "$GSR_REPLAY_MONITOR"
+    else
+      check_warn "Capture display" "$GSR_REPLAY_MONITOR is not currently available."
+    fi
+  fi
+
+  if [[ -L "$GSR_REPLAY_DIR" && ! -e "$GSR_REPLAY_DIR" ]]; then
+    check_error "Output directory" "$GSR_REPLAY_DIR points to a missing target."
+    ((errors += 1))
+  elif [[ -e "$GSR_REPLAY_DIR" && ! -d "$GSR_REPLAY_DIR" ]]; then
+    check_error "Output directory" "$GSR_REPLAY_DIR is not a directory."
+    ((errors += 1))
+  elif [[ -e "$GSR_REPLAY_DIR" && ! -w "$GSR_REPLAY_DIR" ]]; then
+    check_error "Output directory" "$GSR_REPLAY_DIR is not writable."
+    ((errors += 1))
+  else
+    local output_parent="$GSR_REPLAY_DIR"
+    while [[ ! -e "$output_parent" && "$output_parent" != "/" ]]; do
+      output_parent="$(dirname "$output_parent")"
+    done
+    if [[ -d "$output_parent" && -w "$output_parent" ]]; then
+      check_ok "Output directory" "$GSR_REPLAY_DIR"
+    else
+      check_error "Output directory" "Cannot create $GSR_REPLAY_DIR."
+      ((errors += 1))
+    fi
+  fi
+
+  if service_active; then
+    check_ok "Replay buffer" "Active"
+  else
+    check_warn "Replay buffer" "Inactive"
+  fi
+
+  if ((errors > 0)); then
+    printf '\nFound %s blocking issue(s).\n' "$errors"
+    return 1
+  fi
+  printf '\nAll required checks passed.\n'
+}
+
+check_command() {
+  local name="$1" required="$2"
+  if command -v "$name" >/dev/null 2>&1; then
+    check_ok "$name" "$(command -v "$name")"
+    return 0
+  fi
+  if [[ "$required" == "true" ]]; then
+    check_error "$name" "Required command is missing."
+  else
+    check_warn "$name" "Optional command is missing."
+  fi
+  return 1
+}
+
+check_ok() { printf '[OK]    %-18s %s\n' "$1" "$2"; }
+check_warn() { printf '[WARN]  %-18s %s\n' "$1" "$2"; }
+check_error() { printf '[ERROR] %-18s %s\n' "$1" "$2"; }
+
+setup() {
+  require_command gpu-screen-recorder
+  require_command systemctl
+  [[ -f "$SERVICE_PATH" ]] || die "The user service is not installed. $REINSTALL_HINT"
+  systemctl --user show-environment >/dev/null 2>&1 || die "The systemd user manager is unavailable."
+  load_config
+
+  printf '\nGSR Replay setup\n'
+  printf '================\n'
+  printf 'This wizard configures your capture display, replay quality, audio, startup, and desktop integration.\n\n'
+
+  choose_monitor
+  ask_text GSR_REPLAY_RESOLUTION "Output resolution" "$GSR_REPLAY_RESOLUTION" validate_resolution_value
+  ask_integer GSR_REPLAY_FPS "Frame rate" "$GSR_REPLAY_FPS" 1 240
+  ask_integer GSR_REPLAY_SECONDS "Replay duration in seconds" "$GSR_REPLAY_SECONDS" 2 86400
+  choose_audio
+  ask_integer GSR_REPLAY_BITRATE "Video bitrate in kbps" "$GSR_REPLAY_BITRATE" 500 200000
+  choose_storage
+  ask_text GSR_REPLAY_DIR "Replay output directory" "$GSR_REPLAY_DIR" validate_nonempty
+  GSR_REPLAY_DIR="$(expand_home "$GSR_REPLAY_DIR")"
+  ask_yes_no GSR_REPLAY_NOTIFICATIONS "Show desktop notifications?" "$GSR_REPLAY_NOTIFICATIONS"
+
+  local autostart start_now waybar_enabled waybar_was_installed=false autostart_default=false waybar_default=true
+  systemctl --user is-enabled --quiet "$SERVICE_NAME" && autostart_default=true
+  [[ -f "$WAYBAR_MANIFEST_PATH" ]] && waybar_was_installed=true
+  [[ -f "$CONFIG_FILE" ]] && waybar_default="$GSR_REPLAY_WAYBAR_ENABLED"
+  ask_yes_no autostart "Start the replay buffer automatically with your desktop session?" "$autostart_default"
+
+  waybar_enabled="$waybar_default"
+  if [[ -f "${GSR_REPLAY_WAYBAR_CONFIG:-$(default_waybar_config)}" && -f "${GSR_REPLAY_WAYBAR_STYLE:-$(default_waybar_style)}" ]]; then
+    ask_yes_no waybar_enabled "Install the Waybar status module?" "$waybar_default"
+    if [[ "$waybar_enabled" == "true" ]]; then
+      configure_waybar_paths
+    fi
+  elif command -v waybar >/dev/null 2>&1; then
+    printf 'Waybar was detected, but its default config or stylesheet was not found. Skipping integration.\n'
+  fi
+  GSR_REPLAY_WAYBAR_ENABLED="$waybar_enabled"
+
+  validate_config
+  prepare_output_dir
+  write_config
+  systemctl --user daemon-reload
+
+  if [[ "$autostart" == "true" ]]; then
+    systemctl --user enable "$SERVICE_NAME"
+    if service_active; then
+      systemctl --user restart "$SERVICE_NAME"
+    else
+      systemctl --user start "$SERVICE_NAME"
+    fi
+  else
+    systemctl --user disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+    ask_yes_no start_now "Start the replay buffer now?" true
+    [[ "$start_now" == "true" ]] && systemctl --user start "$SERVICE_NAME"
+  fi
+
+  if [[ "$waybar_enabled" == "true" ]]; then
+    install_waybar_integration "$GSR_REPLAY_WAYBAR_CONFIG" "$GSR_REPLAY_WAYBAR_STYLE" "$GSR_REPLAY_WAYBAR_POSITION"
+    reload_waybar
+  elif [[ "$waybar_was_installed" == "true" ]]; then
+    waybar_uninstall_command
+    GSR_REPLAY_WAYBAR_CONFIG=""
+    GSR_REPLAY_WAYBAR_STYLE=""
+    GSR_REPLAY_WAYBAR_ENABLED=false
+    write_config
+  fi
+
+  printf '\nSetup complete.\n'
+  printf '  Display:  %s\n' "$GSR_REPLAY_MONITOR"
+  printf '  Replay:   %s at %s FPS, last %s\n' "$GSR_REPLAY_RESOLUTION" "$GSR_REPLAY_FPS" "$(format_duration "$GSR_REPLAY_SECONDS")"
+  printf '  Output:   %s\n' "$GSR_REPLAY_DIR"
+  printf '\nUse "gsr-replay save" to save a clip and "gsr-replay doctor" to verify the installation.\n'
+}
+
+choose_monitor() {
+  local -a labels=() values=() resolutions=()
+  local name resolution selected default_index=1 index=0 previous_monitor="$GSR_REPLAY_MONITOR"
+
+  while IFS='|' read -r name resolution; do
+    [[ -n "$name" ]] || continue
+    labels+=("$name (${resolution:-unknown resolution})")
+    values+=("$name")
+    resolutions+=("${resolution:-$GSR_REPLAY_RESOLUTION}")
+    ((index += 1))
+    [[ "$name" == "$GSR_REPLAY_MONITOR" ]] && default_index="$index"
+  done < <(gpu-screen-recorder --list-monitors 2>/dev/null || true)
+
+  if [[ -f "$CONFIG_FILE" && "$GSR_REPLAY_MONITOR" != "portal" && "$index" -gt 0 ]]; then
+    local configured_found=false candidate
+    for candidate in "${values[@]}"; do
+      [[ "$candidate" == "$GSR_REPLAY_MONITOR" ]] && configured_found=true
+    done
+    if [[ "$configured_found" == "false" ]]; then
+      labels+=("$GSR_REPLAY_MONITOR (currently unavailable)")
+      values+=("$GSR_REPLAY_MONITOR")
+      resolutions+=("$GSR_REPLAY_RESOLUTION")
+      default_index="${#values[@]}"
+    fi
+  fi
+
+  local detected_count="${#values[@]}"
+  labels+=("Desktop portal (choose when the service starts)")
+  values+=("portal")
+  resolutions+=("$GSR_REPLAY_RESOLUTION")
+  if [[ "$detected_count" -eq 0 || ( -f "$CONFIG_FILE" && "$GSR_REPLAY_MONITOR" == "portal" ) ]]; then
+    default_index="${#values[@]}"
+  fi
+
+  select_option selected "Which display should be captured?" "$default_index" labels values
+  GSR_REPLAY_MONITOR="$selected"
+  if [[ "$selected" != "$previous_monitor" ]]; then
+    GSR_REPLAY_RESOLUTION="${resolutions[$((REPLY_INDEX - 1))]}"
+  fi
+}
+
+choose_audio() {
+  local -a labels=() values=()
+  local name description selected default_index=1 index=0
+
+  while IFS='|' read -r name description; do
+    [[ -n "$name" ]] || continue
+    labels+=("${description:-$name} [$name]")
+    values+=("$name")
+    ((index += 1))
+    [[ "$name" == "$GSR_REPLAY_AUDIO" ]] && default_index="$index"
+  done < <(gpu-screen-recorder --list-audio-devices 2>/dev/null || true)
+
+  if [[ -f "$CONFIG_FILE" && "$GSR_REPLAY_AUDIO" != "none" && "$index" -gt 0 ]]; then
+    local configured_found=false candidate
+    for candidate in "${values[@]}"; do
+      [[ "$candidate" == "$GSR_REPLAY_AUDIO" ]] && configured_found=true
+    done
+    if [[ "$configured_found" == "false" ]]; then
+      labels+=("$GSR_REPLAY_AUDIO (currently unavailable)")
+      values+=("$GSR_REPLAY_AUDIO")
+      default_index="${#values[@]}"
+    fi
+  fi
+
+  labels+=("No audio")
+  values+=("none")
+  [[ "$GSR_REPLAY_AUDIO" == "none" ]] && default_index="${#values[@]}"
+  select_option selected "Which audio source should be recorded?" "$default_index" labels values
+  GSR_REPLAY_AUDIO="$selected"
+}
+
+choose_storage() {
+  local estimate
+  estimate="$(estimated_buffer_mib)"
+  local -a labels=("RAM (estimated ${estimate} MiB; avoids disk wear)" "Disk (uses less RAM)")
+  local -a values=("ram" "disk")
+  local selected default_index=1
+  [[ "$GSR_REPLAY_STORAGE" == "disk" ]] && default_index=2
+  if ((estimate > MAX_RAM_BUFFER_MIB)); then
+    printf '\nThe estimated %s MiB buffer is too large for safe RAM storage; disk storage is required.\n' "$estimate"
+    default_index=2
+  fi
+  select_option selected "Where should the rolling replay buffer be stored?" "$default_index" labels values
+  if [[ "$selected" == "ram" ]] && ((estimate > MAX_RAM_BUFFER_MIB)); then
+    printf 'RAM storage is limited to an estimated %s MiB. Using disk storage instead.\n' "$MAX_RAM_BUFFER_MIB"
+    selected="disk"
+  fi
+  GSR_REPLAY_STORAGE="$selected"
+}
+
+select_option() {
+  local output_name="$1" prompt="$2" default_index="$3"
+  local -n option_labels="$4" option_values="$5"
+  local answer i
+
+  printf '\n%s\n' "$prompt"
+  for i in "${!option_labels[@]}"; do
+    printf '  %d) %s%s\n' "$((i + 1))" "${option_labels[$i]}" "$([[ $((i + 1)) -eq $default_index ]] && printf ' [default]')"
+  done
+  while true; do
+    read -r -p "Select an option [$default_index]: " answer
+    answer="${answer:-$default_index}"
+    if [[ "$answer" =~ ^[0-9]+$ ]] && ((answer >= 1 && answer <= ${#option_values[@]})); then
+      printf -v "$output_name" '%s' "${option_values[$((answer - 1))]}"
+      REPLY_INDEX="$answer"
+      return
+    fi
+    printf 'Please enter a number between 1 and %s.\n' "${#option_values[@]}"
+  done
+}
+
+ask_text() {
+  local output_name="$1" prompt="$2" default_value="$3" validator="$4" answer
+  while true; do
+    read -r -p "$prompt [$default_value]: " answer
+    answer="${answer:-$default_value}"
+    if "$validator" "$answer"; then
+      printf -v "$output_name" '%s' "$answer"
+      return
+    fi
+  done
+}
+
+ask_integer() {
+  local output_name="$1" prompt="$2" default_value="$3" minimum="$4" maximum="$5" answer
+  while true; do
+    read -r -p "$prompt [$default_value]: " answer
+    answer="${answer:-$default_value}"
+    if [[ "$answer" =~ ^[0-9]+$ ]] && ((${#answer} <= ${#maximum})) && ((10#$answer >= minimum && 10#$answer <= maximum)); then
+      printf -v "$output_name" '%s' "$((10#$answer))"
+      return
+    fi
+    printf 'Please enter a number between %s and %s.\n' "$minimum" "$maximum"
+  done
+}
+
+ask_yes_no() {
+  local output_name="$1" prompt="$2" default_value="$3" answer hint
+  [[ "$default_value" == "true" ]] && hint="Y/n" || hint="y/N"
+  while true; do
+    read -r -p "$prompt [$hint] " answer
+    answer="${answer:-$([[ "$default_value" == "true" ]] && printf 'y' || printf 'n')}"
+    case "${answer,,}" in
+      y | yes) printf -v "$output_name" true; return ;;
+      n | no) printf -v "$output_name" false; return ;;
+      *) printf 'Please answer yes or no.\n' ;;
+    esac
+  done
+}
+
+validate_resolution_value() {
+  if [[ "$1" =~ ^[0-9]+x[0-9]+$ ]]; then
+    return 0
+  fi
+  printf 'Resolution must look like 1920x1080.\n'
+  return 1
+}
+
+validate_nonempty() {
+  if [[ -n "$1" ]]; then
+    return 0
+  fi
+  printf 'This value cannot be empty.\n'
+  return 1
+}
+
+write_config() {
+  mkdir -p "$CONFIG_DIR"
+  local temp
+  temp="$(mktemp "$CONFIG_DIR/.config.XXXXXX")"
+  chmod 600 "$temp"
+  {
+    printf '# Generated by gsr-replay setup. Run the wizard again to update it.\n'
+    write_setting GSR_REPLAY_MONITOR "$GSR_REPLAY_MONITOR"
+    write_setting GSR_REPLAY_RESOLUTION "$GSR_REPLAY_RESOLUTION"
+    write_setting GSR_REPLAY_FPS "$GSR_REPLAY_FPS"
+    write_setting GSR_REPLAY_SECONDS "$GSR_REPLAY_SECONDS"
+    write_setting GSR_REPLAY_AUDIO "$GSR_REPLAY_AUDIO"
+    write_setting GSR_REPLAY_BITRATE "$GSR_REPLAY_BITRATE"
+    write_setting GSR_REPLAY_CODEC "$GSR_REPLAY_CODEC"
+    write_setting GSR_REPLAY_STORAGE "$GSR_REPLAY_STORAGE"
+    write_setting GSR_REPLAY_DIR "$GSR_REPLAY_DIR"
+    write_setting GSR_REPLAY_NOTIFICATIONS "$GSR_REPLAY_NOTIFICATIONS"
+    write_setting GSR_REPLAY_WAYBAR_CONFIG "$GSR_REPLAY_WAYBAR_CONFIG"
+    write_setting GSR_REPLAY_WAYBAR_STYLE "$GSR_REPLAY_WAYBAR_STYLE"
+    write_setting GSR_REPLAY_WAYBAR_POSITION "$GSR_REPLAY_WAYBAR_POSITION"
+    write_setting GSR_REPLAY_WAYBAR_ENABLED "$GSR_REPLAY_WAYBAR_ENABLED"
+  } > "$temp"
+  mv "$temp" "$CONFIG_FILE"
+}
+
+write_setting() {
+  validate_text "$1" "$2"
+  printf '%s=%s\n' "$1" "$2"
+}
+
+configure_waybar_paths() {
+  local default_config default_style selected
+  default_config="${GSR_REPLAY_WAYBAR_CONFIG:-$(default_waybar_config)}"
+  default_style="${GSR_REPLAY_WAYBAR_STYLE:-$(default_waybar_style)}"
+  ask_text GSR_REPLAY_WAYBAR_CONFIG "Waybar config file" "$default_config" validate_existing_file
+  ask_text GSR_REPLAY_WAYBAR_STYLE "Waybar stylesheet" "$default_style" validate_existing_file
+
+  local -a labels=("Right" "Center" "Left") values=("right" "center" "left")
+  local default_index=1
+  [[ "$GSR_REPLAY_WAYBAR_POSITION" == "center" ]] && default_index=2
+  [[ "$GSR_REPLAY_WAYBAR_POSITION" == "left" ]] && default_index=3
+  select_option selected "Where should the replay indicator appear?" "$default_index" labels values
+  GSR_REPLAY_WAYBAR_POSITION="$selected"
+}
+
+validate_existing_file() {
+  if [[ -f "$(expand_home "$1")" ]]; then
+    return 0
+  fi
+  printf 'File not found: %s\n' "$1"
+  return 1
+}
+
+default_waybar_config() {
+  if [[ -f "$CONFIG_HOME/waybar/config.jsonc" ]]; then
+    printf '%s\n' "$CONFIG_HOME/waybar/config.jsonc"
+  else
+    printf '%s\n' "$CONFIG_HOME/waybar/config"
+  fi
+}
+
+default_waybar_style() {
+  printf '%s\n' "$CONFIG_HOME/waybar/style.css"
+}
+
+waybar_install_command() {
+  load_config
+  local config="${1:-$GSR_REPLAY_WAYBAR_CONFIG}"
+  local style="${2:-$GSR_REPLAY_WAYBAR_STYLE}"
+  local position="${3:-$GSR_REPLAY_WAYBAR_POSITION}"
+  [[ -n "$config" && -n "$style" ]] || die "Usage: gsr-replay waybar-install <config> <style> [right|center|left]"
+  install_waybar_integration "$config" "$style" "$position"
+  reload_waybar
+}
+
+install_waybar_integration() {
+  local config style position="$3"
+  config="$(canonical_file "$(expand_home "$1")")"
+  style="$(canonical_file "$(expand_home "$2")")"
+  [[ "$position" =~ ^(left|center|right)$ ]] || die "Waybar position must be left, center, or right."
+  reject_managed_omarchy_path "$config"
+  reject_managed_omarchy_path "$style"
+  validate_text "Waybar config path" "$config"
+  validate_text "Waybar stylesheet path" "$style"
+  refuse_waybar_retarget "$config" "$style"
+  preflight_waybar_target "$config" "$position"
+  preflight_waybar_style "$style"
+
+  write_waybar_module
+  patch_waybar_config "$config" "$position"
+  patch_waybar_style "$style"
+  write_waybar_manifest "$config" "$style" "$position"
+  printf 'Waybar integration installed in %s.\n' "$config"
+}
+
+write_waybar_module() {
+  mkdir -p "$CONFIG_DIR"
+  local temp cli
+  temp="$(mktemp "$CONFIG_DIR/.waybar.XXXXXX")"
+  cli="$(json_escape "$CLI_PATH")"
+  {
+    printf '{\n'
+    printf '  "custom/gsr-replay": {\n'
+    printf '    "exec": "%s waybar",\n' "$cli"
+    printf '    "return-type": "json",\n'
+    printf '    "format": "{}",\n'
+    printf '    "escape": true,\n'
+    printf '    "tooltip": true,\n'
+    printf '    "interval": 3,\n'
+    printf '    "on-click": "%s save",\n' "$cli"
+    printf '    "on-click-right": "%s toggle"\n' "$cli"
+    printf '  }\n'
+    printf '}\n'
+  } > "$temp"
+  chmod 600 "$temp"
+  mv "$temp" "$WAYBAR_MODULE_PATH"
+}
+
+patch_waybar_config() {
+  local config="$1" position="$2" line trimmed base temp
+  local root_found=false include_present=false module_inserted=false include_inserted=false
+  base="$(mktemp "$(dirname "$config")/.gsr-replay-base.XXXXXX")"
+  temp="$(mktemp "$(dirname "$config")/.gsr-replay-config.XXXXXX")"
+  trap 'rm -f -- "$base" "$temp"' RETURN
+  strip_waybar_blocks "$config" "$base"
+  preflight_waybar_config "$base" "$position"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    trimmed="$(trim_whitespace "$line")"
+    [[ "$trimmed" =~ ^\"include\"[[:space:]]*:[[:space:]]*\[[[:space:]]*$ ]] && include_present=true
+  done < "$base"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    trimmed="$(trim_whitespace "$line")"
+    printf '%s\n' "$line" >> "$temp"
+
+    if [[ "$root_found" == "false" && "$trimmed" == "{" ]]; then
+      root_found=true
+      if [[ "$include_present" == "false" ]]; then
+        {
+          printf '  // gsr-replay:include-start\n'
+          printf '  "include": ["%s"],\n' "$(json_escape "$WAYBAR_MODULE_PATH")"
+          printf '  // gsr-replay:include-end\n'
+        } >> "$temp"
+        include_inserted=true
+      fi
+      continue
+    fi
+
+    if [[ "$include_present" == "true" && "$include_inserted" == "false" && "$trimmed" =~ ^\"include\"[[:space:]]*:[[:space:]]*\[[[:space:]]*$ ]]; then
+      {
+        printf '    // gsr-replay:include-start\n'
+        printf '    "%s",\n' "$(json_escape "$WAYBAR_MODULE_PATH")"
+        printf '    // gsr-replay:include-end\n'
+      } >> "$temp"
+      include_inserted=true
+    fi
+
+    if [[ "$module_inserted" == "false" && "$trimmed" =~ ^\"modules-$position\"[[:space:]]*:[[:space:]]*\[[[:space:]]*$ ]]; then
+      {
+        printf '    // gsr-replay:module-start\n'
+        printf '    "custom/gsr-replay",\n'
+        printf '    // gsr-replay:module-end\n'
+      } >> "$temp"
+      module_inserted=true
+    fi
+  done < "$base"
+
+  [[ "$include_inserted" == "true" && "$module_inserted" == "true" ]] || die "Could not safely patch $config."
+  chmod --reference="$config" "$temp" 2>/dev/null || chmod 600 "$temp"
+  if cmp -s "$config" "$temp"; then
+    rm -f "$base" "$temp"
+    trap - RETURN
+    return
+  fi
+  backup_file "$config"
+  mv "$temp" "$config"
+  rm -f "$base"
+  trap - RETURN
+}
+
+preflight_waybar_target() {
+  local config="$1" position="$2" base
+  base="$(mktemp "$(dirname "$config")/.gsr-replay-preflight.XXXXXX")"
+  strip_waybar_blocks "$config" "$base"
+  if ! preflight_waybar_config "$base" "$position"; then
+    rm -f "$base"
+    return 1
+  fi
+  rm -f "$base"
+}
+
+preflight_waybar_config() {
+  local config="$1" position="$2" line trimmed first_structure="" target_count=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    trimmed="$(trim_whitespace "$line")"
+    [[ -z "$trimmed" || "$trimmed" == //* || "$trimmed" == \#* || "$trimmed" == '/**'* || "$trimmed" == \** ]] && continue
+    [[ -z "$first_structure" ]] && first_structure="$trimmed"
+    if [[ "$trimmed" =~ ^\"modules-$position\"[[:space:]]*:[[:space:]]*\[[[:space:]]*$ ]]; then
+      ((target_count += 1))
+    elif [[ "$trimmed" == *"\"modules-$position\""* ]]; then
+      die "Unsupported Waybar layout: modules-$position must use a multiline array."
+    fi
+    if [[ "$trimmed" == *'"include"'* && ! "$trimmed" =~ ^\"include\"[[:space:]]*:[[:space:]]*\[[[:space:]]*$ ]]; then
+      die "Unsupported Waybar layout: include must use a multiline array or be managed by gsr-replay."
+    fi
+    if [[ "$trimmed" == *'"custom/gsr-replay"'* ]]; then
+      die "An unmanaged custom/gsr-replay entry already exists in $config."
+    fi
+  done < "$config"
+  [[ "$first_structure" == "{" ]] || die "Only a single-object Waybar config is supported; no changes were made."
+  [[ "$target_count" -eq 1 ]] || die "Expected exactly one multiline modules-$position array in $config."
+}
+
+strip_waybar_blocks() {
+  local source="$1" destination="$2" line trimmed skipping=false block=""
+  : > "$destination"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    trimmed="$(trim_whitespace "$line")"
+    case "$trimmed" in
+      '// gsr-replay:include-start')
+        [[ "$skipping" == "false" ]] || die "Malformed gsr-replay markers in $source."
+        skipping=true
+        block=include
+        continue
+        ;;
+      '// gsr-replay:module-start')
+        [[ "$skipping" == "false" ]] || die "Malformed gsr-replay markers in $source."
+        skipping=true
+        block=module
+        continue
+        ;;
+      '// gsr-replay:include-end')
+        [[ "$skipping" == "true" && "$block" == "include" ]] || die "Malformed gsr-replay markers in $source."
+        skipping=false
+        block=""
+        continue
+        ;;
+      '// gsr-replay:module-end')
+        [[ "$skipping" == "true" && "$block" == "module" ]] || die "Malformed gsr-replay markers in $source."
+        skipping=false
+        block=""
+        continue
+        ;;
+    esac
+    [[ "$skipping" == "false" ]] && printf '%s\n' "$line" >> "$destination"
+  done < "$source"
+  [[ "$skipping" == "false" ]] || die "Malformed gsr-replay markers in $source; no changes were made."
+}
+
+patch_waybar_style() {
+  local style="$1" temp start_count
+  preflight_waybar_style "$style"
+  start_count="$(count_exact_lines "$style" '/* gsr-replay:start */')"
+  if [[ "$start_count" -eq 1 ]]; then
+    return
+  fi
+  temp="$(mktemp "$(dirname "$style")/.gsr-replay-style.XXXXXX")"
+  chmod --reference="$style" "$temp" 2>/dev/null || chmod 600 "$temp"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    printf '%s\n' "$line" >> "$temp"
+  done < "$style"
+  cat >> "$temp" <<'EOF'
+
+/* gsr-replay:start */
+#custom-gsr-replay {
+  margin: 0 6px;
+  font-weight: bold;
+}
+
+#custom-gsr-replay.active {
+  color: #e06c75;
+}
+
+#custom-gsr-replay.inactive {
+  opacity: 0.45;
+}
+
+#custom-gsr-replay.failed {
+  color: #e5c07b;
+}
+/* gsr-replay:end */
+EOF
+  backup_file "$style"
+  mv "$temp" "$style"
+}
+
+preflight_waybar_style() {
+  local style="$1" start_count end_count
+  start_count="$(count_exact_lines "$style" '/* gsr-replay:start */')"
+  end_count="$(count_exact_lines "$style" '/* gsr-replay:end */')"
+  [[ "$start_count" == "$end_count" ]] || die "Malformed gsr-replay CSS markers in $style; no changes were made."
+  [[ "$start_count" -le 1 ]] || die "Multiple gsr-replay CSS blocks found in $style."
+}
+
+refuse_waybar_retarget() {
+  local config="$1" style="$2" installed_config="" installed_style=""
+  [[ -f "$WAYBAR_MANIFEST_PATH" ]] || return 0
+  {
+    IFS= read -r installed_config || true
+    IFS= read -r installed_style || true
+  } < "$WAYBAR_MANIFEST_PATH"
+  if [[ "$installed_config" != "$config" || "$installed_style" != "$style" ]]; then
+    die "Waybar integration is installed in different files. Run 'gsr-replay waybar-uninstall' before changing targets."
+  fi
+}
+
+waybar_uninstall_command() {
+  load_config
+  local config="${1:-}" style="${2:-}" position=""
+  if [[ -z "$config" && -f "$WAYBAR_MANIFEST_PATH" ]]; then
+    {
+      IFS= read -r config || true
+      IFS= read -r style || true
+      IFS= read -r position || true
+    } < "$WAYBAR_MANIFEST_PATH"
+  fi
+  config="${config:-$GSR_REPLAY_WAYBAR_CONFIG}"
+  style="${style:-$GSR_REPLAY_WAYBAR_STYLE}"
+  if [[ -n "$config" ]]; then
+    if [[ -f "$(expand_home "$config")" ]]; then
+      remove_waybar_config "$(realpath "$(expand_home "$config")")"
+    else
+      printf 'Warning: Waybar config no longer exists: %s\n' "$config" >&2
+    fi
+  fi
+  if [[ -n "$style" ]]; then
+    if [[ -f "$(expand_home "$style")" ]]; then
+      remove_waybar_style "$(realpath "$(expand_home "$style")")"
+    else
+      printf 'Warning: Waybar stylesheet no longer exists: %s\n' "$style" >&2
+    fi
+  fi
+  rm -f "$WAYBAR_MODULE_PATH"
+  rm -f "$WAYBAR_MANIFEST_PATH"
+  reload_waybar
+  printf 'Waybar integration removed.\n'
+}
+
+remove_waybar_config() {
+  local config="$1" temp
+  temp="$(mktemp "$(dirname "$config")/.gsr-replay-config.XXXXXX")"
+  chmod --reference="$config" "$temp" 2>/dev/null || chmod 600 "$temp"
+  strip_waybar_blocks "$config" "$temp"
+  if cmp -s "$config" "$temp"; then
+    rm -f "$temp"
+    return 0
+  fi
+  backup_file "$config"
+  mv "$temp" "$config"
+}
+
+remove_waybar_style() {
+  local style="$1" line temp skipping=false start_count end_count
+  start_count="$(count_exact_lines "$style" '/* gsr-replay:start */')"
+  end_count="$(count_exact_lines "$style" '/* gsr-replay:end */')"
+  [[ "$start_count" == "$end_count" ]] || die "Malformed gsr-replay CSS markers in $style; no changes were made."
+  [[ "$start_count" -eq 0 ]] && return 0
+  [[ "$start_count" -eq 1 ]] || die "Multiple gsr-replay CSS blocks found in $style."
+  temp="$(mktemp "$(dirname "$style")/.gsr-replay-style.XXXXXX")"
+  chmod --reference="$style" "$temp" 2>/dev/null || chmod 600 "$temp"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == '/* gsr-replay:start */' ]]; then
+      skipping=true
+      continue
+    fi
+    if [[ "$line" == '/* gsr-replay:end */' ]]; then
+      skipping=false
+      continue
+    fi
+    [[ "$skipping" == "false" ]] && printf '%s\n' "$line" >> "$temp"
+  done < "$style"
+  [[ "$skipping" == "false" ]] || die "Malformed gsr-replay CSS markers in $style; no changes were made."
+  backup_file "$style"
+  mv "$temp" "$style"
+}
+
+write_waybar_manifest() {
+  local config="$1" style="$2" position="$3" temp
+  temp="$(mktemp "$CONFIG_DIR/.waybar-install.XXXXXX")"
+  chmod 600 "$temp"
+  printf '%s\n%s\n%s\n' "$config" "$style" "$position" > "$temp"
+  mv "$temp" "$WAYBAR_MANIFEST_PATH"
+}
+
+canonical_file() {
+  [[ -f "$1" ]] || die "File not found: $1"
+  realpath "$1"
+}
+
+backup_file() {
+  local path="$1" backup
+  backup="$(mktemp "$path.gsr-replay.bak.XXXXXX")"
+  rm -f "$backup"
+  cp -a "$path" "$backup"
+}
+
+count_exact_lines() {
+  local file="$1" needle="$2" line count=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == "$needle" ]] && ((count += 1))
+  done < "$file"
+  printf '%s\n' "$count"
+}
+
+trim_whitespace() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s\n' "$value"
+}
+
+reject_managed_omarchy_path() {
+  if [[ "$1" == "$HOME/.local/share/omarchy/"* ]]; then
+    die "Refusing to modify Omarchy-managed source files: $1"
+  fi
+}
+
+reload_waybar() {
+  if command -v omarchy >/dev/null 2>&1; then
+    omarchy restart waybar
+  elif command -v waybar >/dev/null 2>&1 && command -v pkill >/dev/null 2>&1; then
+    pkill -SIGUSR2 -x waybar 2>/dev/null || true
+  fi
+}
+
+waybar_status() {
+  load_config
+  local state text tooltip class
+  text="REC"
+  if service_active; then
+    state="active"
+    class="active"
+    tooltip="Replay buffer is active"$'\n'"Display: $GSR_REPLAY_MONITOR"$'\n'"Buffer: $(format_duration "$GSR_REPLAY_SECONDS")"$'\n'"Left-click: Save clip"$'\n'"Right-click: Stop"
+  elif command -v systemctl >/dev/null 2>&1 && systemctl --user is-failed --quiet "$SERVICE_NAME"; then
+    state="failed"
+    class="failed"
+    tooltip="Replay buffer failed"$'\n'"Right-click: Start again"
+  else
+    state="inactive"
+    class="inactive"
+    tooltip="Replay buffer is off"$'\n'"Right-click: Start"
+  fi
+  printf '{"text":"%s","alt":"%s","tooltip":"%s","class":"%s"}\n' \
+    "$(json_escape "$text")" "$(json_escape "$state")" "$(json_escape "$tooltip")" "$(json_escape "$class")"
+}
+
+json_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  printf '%s' "$value"
+}
+
+list_monitors() {
+  require_command gpu-screen-recorder
+  gpu-screen-recorder --list-monitors
+}
+
+list_audio() {
+  require_command gpu-screen-recorder
+  gpu-screen-recorder --list-audio-devices
+}
+
+notify() {
+  local title="$1" body="$2" urgency="${3:-normal}" timeout="${4:-5000}"
+  [[ "$GSR_REPLAY_NOTIFICATIONS" == "true" ]] || return 0
+  command -v notify-send >/dev/null 2>&1 || return 0
+  notify-send --app-name="GSR Replay" --urgency="$urgency" --expire-time="$timeout" "$title" "$body" || true
+}
+
+format_duration() {
+  local seconds="$1"
+  if ((seconds % 3600 == 0)); then
+    pluralize "$((seconds / 3600))" hour
+  elif ((seconds % 60 == 0)); then
+    pluralize "$((seconds / 60))" minute
+  else
+    pluralize "$seconds" second
+  fi
+}
+
+estimated_buffer_mib() {
+  printf '%s\n' "$(((10#$GSR_REPLAY_BITRATE * 1000 * 10#$GSR_REPLAY_SECONDS / 8 + 1048575) / 1048576))"
+}
+
+pluralize() {
+  local amount="$1" unit="$2"
+  if ((amount == 1)); then
+    printf '%s %s' "$amount" "$unit"
+  else
+    printf '%s %ss' "$amount" "$unit"
+  fi
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command is missing: $1"
+}
+
+die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+main "$@"

@@ -1,0 +1,7 @@
+post_install() {
+  printf '%s\n' 'Run "gsr-replay setup" as your desktop user to complete onboarding.'
+}
+
+post_upgrade() {
+  printf '%s\n' 'Restart the replay buffer to use the updated package: gsr-replay restart'
+}

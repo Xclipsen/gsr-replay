@@ -1,0 +1,6 @@
+*.backup.*
+*.bak.*
+*.tmp
+*.pkg.tar.*
+packaging/arch/pkg/
+packaging/arch/src/

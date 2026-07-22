@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CALLBACK_PATH="$(realpath "${BASH_SOURCE[0]}")"
+
+if [[ "$CALLBACK_PATH" == /usr/lib/gsr-replay/* ]]; then
+  exec /usr/bin/gsr-replay saved "$@"
+else
+  exec "$HOME/.local/bin/gsr-replay" saved "$@"
+fi

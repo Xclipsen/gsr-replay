@@ -1,0 +1,24 @@
+# Maintainer: Xclipsen <101043764+Xclipsen@users.noreply.github.com>
+pkgname=gsr-replay
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Instant replay onboarding and service for GPU Screen Recorder"
+arch=('any')
+url="https://github.com/Xclipsen/gsr-replay"
+license=('MIT')
+depends=('bash' 'coreutils' 'diffutils' 'gpu-screen-recorder' 'systemd')
+optdepends=('libnotify: desktop save notifications'
+            'waybar: replay status and click controls')
+install=gsr-replay.install
+source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
+sha256sums=('9dd83810879cb76933dce3365a6a2afcf9344796a632c20be5a6b58379969631')
+
+package() {
+  cd "$srcdir/$pkgname-$pkgver"
+
+  install -Dm755 bin/gsr-replay "$pkgdir/usr/bin/gsr-replay"
+  install -Dm755 bin/gsr-replay-callback "$pkgdir/usr/lib/gsr-replay/gsr-replay-callback"
+  install -Dm644 packaging/arch/gsr-replay.service "$pkgdir/usr/lib/systemd/user/gsr-replay.service"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

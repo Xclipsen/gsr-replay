@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Check shell syntax
+        run: for file in bin/* install.sh uninstall.sh tests/run.sh packaging/arch/gsr-replay.install; do bash -n "$file"; done
+      - name: Run shellcheck
+        run: shellcheck bin/* install.sh uninstall.sh tests/run.sh
+      - name: Run tests
+        run: bash tests/run.sh
+      - name: Verify systemd service
+        run: install -Dm755 bin/gsr-replay "$HOME/.local/bin/gsr-replay" && systemd-analyze --user verify systemd/gsr-replay.service

@@ -1,0 +1,18 @@
+[Unit]
+Description=GPU Screen Recorder replay buffer
+Documentation=https://github.com/Xclipsen/gsr-replay
+PartOf=graphical-session.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/gsr-replay run
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=graphical-session.target
