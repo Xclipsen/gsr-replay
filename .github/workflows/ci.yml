@@ -22,3 +22,19 @@ jobs:
         run: bash tests/run.sh
       - name: Verify systemd service
         run: install -Dm755 bin/gsr-replay "$HOME/.local/bin/gsr-replay" && systemd-analyze --user verify systemd/gsr-replay.service
+
+  package:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install package validators
+        run: pacman -Syu --noconfirm --needed git namcap shellcheck
+      - name: Build exact release payload
+        run: |
+          useradd --create-home builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          su builder -c 'bash packaging/arch/create-source-archive'
+          su builder -c 'cd packaging/arch && makepkg --cleanbuild --nodeps --noconfirm'
+      - name: Inspect package
+        run: namcap packaging/arch/PKGBUILD packaging/arch/gsr-replay-*.pkg.tar.zst

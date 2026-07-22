@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly SERVICE_NAME="gsr-replay.service"
 readonly CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 readonly CONFIG_DIR="$CONFIG_HOME/gsr-replay"
@@ -35,7 +35,8 @@ main() {
     config) show_config ;;
     run) run_recorder ;;
     saved) replay_saved "$@" ;;
-    waybar) waybar_status ;;
+    status-json | waybar) status_json ;;
+    verify-output) verify_output "$@" ;;
     waybar-install) waybar_install_command "$@" ;;
     waybar-uninstall) waybar_uninstall_command "$@" ;;
     list-monitors) list_monitors ;;
@@ -64,7 +65,8 @@ Commands:
   config              Print the configuration file
   list-monitors       List capture displays
   list-audio          List audio sources
-  waybar              Print Waybar module status as JSON
+  status-json         Print machine-readable service status as JSON
+  waybar              Alias for status-json
   waybar-install      Install the Waybar integration
   waybar-uninstall    Remove the Waybar integration
   version             Print the installed version
@@ -83,7 +85,8 @@ set_defaults() {
   GSR_REPLAY_BITRATE="${GSR_REPLAY_BITRATE:-15000}"
   GSR_REPLAY_CODEC="${GSR_REPLAY_CODEC:-auto}"
   GSR_REPLAY_STORAGE="${GSR_REPLAY_STORAGE:-ram}"
-  GSR_REPLAY_DIR="${GSR_REPLAY_DIR:-$(default_output_dir)}"
+  GSR_REPLAY_DIR="${GSR_REPLAY_DIR:-${GSR_REPLAY_DEFAULT_DIR:-$(default_output_dir)}}"
+  GSR_REPLAY_REQUIRED_FS_UUID="${GSR_REPLAY_REQUIRED_FS_UUID:-${GSR_REPLAY_DEFAULT_FS_UUID:-}}"
   GSR_REPLAY_NOTIFICATIONS="${GSR_REPLAY_NOTIFICATIONS:-true}"
   GSR_REPLAY_WAYBAR_CONFIG="${GSR_REPLAY_WAYBAR_CONFIG:-}"
   GSR_REPLAY_WAYBAR_STYLE="${GSR_REPLAY_WAYBAR_STYLE:-}"
@@ -98,7 +101,7 @@ load_config() {
     while IFS='=' read -r key value || [[ -n "$key" ]]; do
       [[ -z "$key" || "$key" == \#* ]] && continue
       case "$key" in
-        GSR_REPLAY_MONITOR | GSR_REPLAY_RESOLUTION | GSR_REPLAY_FPS | GSR_REPLAY_SECONDS | GSR_REPLAY_AUDIO | GSR_REPLAY_BITRATE | GSR_REPLAY_CODEC | GSR_REPLAY_STORAGE | GSR_REPLAY_DIR | GSR_REPLAY_NOTIFICATIONS | GSR_REPLAY_WAYBAR_CONFIG | GSR_REPLAY_WAYBAR_STYLE | GSR_REPLAY_WAYBAR_POSITION | GSR_REPLAY_WAYBAR_ENABLED)
+        GSR_REPLAY_MONITOR | GSR_REPLAY_RESOLUTION | GSR_REPLAY_FPS | GSR_REPLAY_SECONDS | GSR_REPLAY_AUDIO | GSR_REPLAY_BITRATE | GSR_REPLAY_CODEC | GSR_REPLAY_STORAGE | GSR_REPLAY_DIR | GSR_REPLAY_REQUIRED_FS_UUID | GSR_REPLAY_NOTIFICATIONS | GSR_REPLAY_WAYBAR_CONFIG | GSR_REPLAY_WAYBAR_STYLE | GSR_REPLAY_WAYBAR_POSITION | GSR_REPLAY_WAYBAR_ENABLED)
           printf -v "$key" '%s' "$value"
           ;;
         *) die "Unknown setting in $CONFIG_FILE: $key" ;;
@@ -106,6 +109,16 @@ load_config() {
     done < "$CONFIG_FILE"
   fi
   GSR_REPLAY_DIR="$(expand_home "$GSR_REPLAY_DIR")"
+  apply_enforced_output
+}
+
+require_config() {
+  [[ -f "$CONFIG_FILE" ]] || die "No configuration found. Run 'gsr-replay setup'."
+}
+
+apply_enforced_output() {
+  [[ -z ${GSR_REPLAY_ENFORCED_DIR:-} ]] || GSR_REPLAY_DIR="$(expand_home "$GSR_REPLAY_ENFORCED_DIR")"
+  [[ -z ${GSR_REPLAY_ENFORCED_FS_UUID:-} ]] || GSR_REPLAY_REQUIRED_FS_UUID="$GSR_REPLAY_ENFORCED_FS_UUID"
 }
 
 default_output_dir() {
@@ -141,6 +154,7 @@ validate_config() {
   [[ "$GSR_REPLAY_DIR" == /* ]] || die "Replay output directory must be an absolute path."
   validate_text "Audio source" "$GSR_REPLAY_AUDIO"
   validate_text "Replay output directory" "$GSR_REPLAY_DIR"
+  [[ -z "$GSR_REPLAY_REQUIRED_FS_UUID" || "$GSR_REPLAY_REQUIRED_FS_UUID" =~ ^[A-Fa-f0-9-]+$ ]] || die "Required filesystem UUID contains unsupported characters."
   if [[ "$GSR_REPLAY_STORAGE" == "ram" ]] && (( $(estimated_buffer_mib) > MAX_RAM_BUFFER_MIB )); then
     die "The estimated RAM buffer exceeds ${MAX_RAM_BUFFER_MIB} MiB. Choose disk storage or lower the duration/bitrate."
   fi
@@ -155,18 +169,43 @@ validate_integer() {
 
 validate_text() {
   local label="$1" value="$2"
-  [[ "$value" != *$'\n'* && "$value" != *$'\r'* && "$value" != *$'\t'* ]] || die "$label contains unsupported control characters."
+  [[ ! "$value" =~ [[:cntrl:]] ]] || die "$label contains unsupported control characters."
 }
 
 prepare_output_dir() {
   if [[ -L "$GSR_REPLAY_DIR" && ! -e "$GSR_REPLAY_DIR" ]]; then
     die "Replay output is unavailable: $GSR_REPLAY_DIR points to a missing target."
   fi
+  output_filesystem_available || die "Replay output requires filesystem UUID $GSR_REPLAY_REQUIRED_FS_UUID, but it is not mounted."
   mkdir -p "$GSR_REPLAY_DIR"
   [[ -d "$GSR_REPLAY_DIR" && -w "$GSR_REPLAY_DIR" ]] || die "Replay output is not writable: $GSR_REPLAY_DIR"
 }
 
+output_filesystem_available() {
+  local probe actual_uuid
+  [[ -n "$GSR_REPLAY_REQUIRED_FS_UUID" ]] || return 0
+  command -v findmnt >/dev/null 2>&1 || return 1
+  probe="$GSR_REPLAY_DIR"
+  while [[ ! -e "$probe" && "$probe" != "/" ]]; do
+    probe="$(dirname -- "$probe")"
+  done
+  actual_uuid="$(findmnt -n -o UUID --target "$probe" 2>/dev/null || true)"
+  [[ "$actual_uuid" == "$GSR_REPLAY_REQUIRED_FS_UUID" ]]
+}
+
+verify_output() {
+  (( $# == 2 )) || die "Usage: gsr-replay verify-output <directory> <filesystem-uuid>"
+  local expected_dir
+  expected_dir="$(expand_home "$1")"
+  load_config
+  validate_config
+  [[ "$GSR_REPLAY_DIR" == "$expected_dir" ]] || die "Replay output is $GSR_REPLAY_DIR, expected $expected_dir."
+  [[ "$GSR_REPLAY_REQUIRED_FS_UUID" == "$2" ]] || die "Replay filesystem UUID does not match the required integration."
+  output_filesystem_available || die "Required replay filesystem is not mounted."
+}
+
 run_recorder() {
+  require_config
   load_config
   validate_config
   require_command gpu-screen-recorder
@@ -195,7 +234,7 @@ run_recorder() {
     args+=( -a "$GSR_REPLAY_AUDIO" )
   fi
 
-  exec gpu-screen-recorder "${args[@]}"
+  exec -a gsr-replay-buffer gpu-screen-recorder "${args[@]}"
 }
 
 replay_saved() {
@@ -206,10 +245,12 @@ replay_saved() {
 }
 
 save_replay() {
+  require_config
   load_config
   validate_config
   prepare_output_dir
   require_command systemctl
+  verify_service_unit
 
   if ! service_active; then
     notify "Replay buffer is starting" "Try saving again in a moment." normal 5000
@@ -224,8 +265,14 @@ save_replay() {
 
 service_command() {
   local action="$1"
+  if [[ "$action" != "stop" ]]; then
+    require_config
+    load_config
+    validate_config
+    prepare_output_dir
+  fi
   require_command systemctl
-  [[ -f "$SERVICE_PATH" ]] || die "The user service is not installed. $REINSTALL_HINT"
+  verify_service_unit
   systemctl --user "$action" "$SERVICE_NAME"
   printf 'Replay buffer %s.\n' "$(past_tense "$action")"
 }
@@ -242,6 +289,26 @@ service_active() {
   command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet "$SERVICE_NAME"
 }
 
+service_fragment() {
+  systemctl --user show "$SERVICE_NAME" --property=FragmentPath --value 2>/dev/null
+}
+
+service_dropins() {
+  systemctl --user show "$SERVICE_NAME" --property=DropInPaths --value 2>/dev/null
+}
+
+verify_service_unit() {
+  [[ -f "$SERVICE_PATH" ]] || die "The user service is not installed. $REINSTALL_HINT"
+
+  local fragment expected dropins
+  fragment="$(service_fragment)" || die "Could not inspect the loaded user service."
+  [[ -n "$fragment" ]] || die "The user service is installed but not loaded. Run 'systemctl --user daemon-reload' and try again."
+  expected="$(realpath "$SERVICE_PATH")"
+  [[ "$fragment" == "$expected" ]] || die "The loaded user service is $fragment, but this installation expects $expected. Remove or migrate the overriding unit, run 'systemctl --user daemon-reload', and try again."
+  dropins="$(service_dropins)" || die "Could not inspect user service drop-ins."
+  [[ -z "$dropins" ]] || die "The loaded user service has unsupported drop-ins: $dropins. Remove them, run 'systemctl --user daemon-reload', and try again."
+}
+
 past_tense() {
   case "$1" in
     start) printf 'started' ;;
@@ -251,6 +318,11 @@ past_tense() {
 }
 
 status() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    printf 'Replay buffer: configuration missing\n'
+    printf 'Run "gsr-replay setup" to create the configuration.\n'
+    return 1
+  fi
   load_config
   if ! (validate_config >/dev/null 2>&1); then
     printf 'Replay buffer: configuration error\n'
@@ -302,7 +374,24 @@ doctor() {
   fi
 
   if [[ -f "$SERVICE_PATH" ]]; then
-    check_ok "User service" "$SERVICE_PATH"
+    local fragment expected dropins
+    fragment="$(service_fragment || true)"
+    expected="$(realpath "$SERVICE_PATH")"
+    if [[ -z "$fragment" ]]; then
+      check_error "User service" "Installed at $expected but not loaded."
+      ((errors += 1))
+    elif [[ "$fragment" != "$expected" ]]; then
+      check_error "User service" "Loaded from $fragment; expected $expected."
+      ((errors += 1))
+    else
+      dropins="$(service_dropins || true)"
+      if [[ -n "$dropins" ]]; then
+        check_error "User service" "Unsupported drop-ins: $dropins"
+        ((errors += 1))
+      else
+        check_ok "User service" "$expected"
+      fi
+    fi
   else
     check_error "User service" "Missing. $REINSTALL_HINT"
     ((errors += 1))
@@ -349,6 +438,12 @@ doctor() {
       ((errors += 1))
     fi
   fi
+  if ! output_filesystem_available; then
+    check_error "Output filesystem" "Required UUID $GSR_REPLAY_REQUIRED_FS_UUID is not mounted."
+    ((errors += 1))
+  elif [[ -n "$GSR_REPLAY_REQUIRED_FS_UUID" ]]; then
+    check_ok "Output filesystem" "$GSR_REPLAY_REQUIRED_FS_UUID"
+  fi
 
   if service_active; then
     check_ok "Replay buffer" "Active"
@@ -384,8 +479,9 @@ check_error() { printf '[ERROR] %-18s %s\n' "$1" "$2"; }
 setup() {
   require_command gpu-screen-recorder
   require_command systemctl
-  [[ -f "$SERVICE_PATH" ]] || die "The user service is not installed. $REINSTALL_HINT"
   systemctl --user show-environment >/dev/null 2>&1 || die "The systemd user manager is unavailable."
+  systemctl --user daemon-reload
+  verify_service_unit
   load_config
 
   printf '\nGSR Replay setup\n'
@@ -401,6 +497,7 @@ setup() {
   choose_storage
   ask_text GSR_REPLAY_DIR "Replay output directory" "$GSR_REPLAY_DIR" validate_nonempty
   GSR_REPLAY_DIR="$(expand_home "$GSR_REPLAY_DIR")"
+  apply_enforced_output
   ask_yes_no GSR_REPLAY_NOTIFICATIONS "Show desktop notifications?" "$GSR_REPLAY_NOTIFICATIONS"
 
   local autostart start_now waybar_enabled waybar_was_installed=false autostart_default=false waybar_default=true
@@ -639,6 +736,7 @@ write_config() {
     write_setting GSR_REPLAY_CODEC "$GSR_REPLAY_CODEC"
     write_setting GSR_REPLAY_STORAGE "$GSR_REPLAY_STORAGE"
     write_setting GSR_REPLAY_DIR "$GSR_REPLAY_DIR"
+    write_setting GSR_REPLAY_REQUIRED_FS_UUID "$GSR_REPLAY_REQUIRED_FS_UUID"
     write_setting GSR_REPLAY_NOTIFICATIONS "$GSR_REPLAY_NOTIFICATIONS"
     write_setting GSR_REPLAY_WAYBAR_CONFIG "$GSR_REPLAY_WAYBAR_CONFIG"
     write_setting GSR_REPLAY_WAYBAR_STYLE "$GSR_REPLAY_WAYBAR_STYLE"
@@ -1042,18 +1140,27 @@ reject_managed_omarchy_path() {
 }
 
 reload_waybar() {
-  if command -v omarchy >/dev/null 2>&1; then
-    omarchy restart waybar
+  if command -v omarchy-restart-waybar >/dev/null 2>&1; then
+    omarchy-restart-waybar
   elif command -v waybar >/dev/null 2>&1 && command -v pkill >/dev/null 2>&1; then
     pkill -SIGUSR2 -x waybar 2>/dev/null || true
   fi
 }
 
-waybar_status() {
+status_json() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    printf '%s\n' '{"text":"REC","alt":"failed","tooltip":"Replay buffer is not configured\\nRun gsr-replay setup","class":"failed"}'
+    return 0
+  fi
   load_config
+  validate_config
   local state text tooltip class
   text="REC"
-  if service_active; then
+  if ! output_filesystem_available; then
+    state="failed"
+    class="failed"
+    tooltip="Replay storage is unavailable"$'\n'"Required filesystem: $GSR_REPLAY_REQUIRED_FS_UUID"
+  elif service_active; then
     state="active"
     class="active"
     tooltip="Replay buffer is active"$'\n'"Display: $GSR_REPLAY_MONITOR"$'\n'"Buffer: $(format_duration "$GSR_REPLAY_SECONDS")"$'\n'"Left-click: Save clip"$'\n'"Right-click: Stop"
@@ -1098,7 +1205,7 @@ notify() {
 }
 
 format_duration() {
-  local seconds="$1"
+  local seconds=$((10#$1))
   if ((seconds % 3600 == 0)); then
     pluralize "$((seconds / 3600))" hour
   elif ((seconds % 60 == 0)); then

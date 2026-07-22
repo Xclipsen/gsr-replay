@@ -2,6 +2,8 @@
 
 A small, production-ready instant replay controller for [GPU Screen Recorder](https://git.dec05eba.com/gpu-screen-recorder/about/). It provides guided onboarding, a resilient systemd user service, desktop notifications, and optional Waybar integration.
 
+Omarchy 4 can consume the `status-json` command for native Quickshell integration without enabling the optional Waybar support.
+
 ## Features
 
 - Interactive setup with automatic display and audio-source discovery
@@ -78,6 +80,7 @@ gsr-replay stop               Stop the replay buffer
 gsr-replay toggle             Start or stop the replay buffer
 gsr-replay save               Save the current buffer
 gsr-replay status             Show service and capture settings
+gsr-replay status-json        Show machine-readable service status
 gsr-replay doctor             Check the installation
 gsr-replay list-monitors      List capture displays
 gsr-replay list-audio         List audio sources
@@ -118,9 +121,13 @@ Configuration is stored in:
 ~/.config/gsr-replay/config
 ```
 
-The generated file is shell-compatible and only writable by the current user. Prefer `gsr-replay setup` over manual edits because the wizard validates every setting.
+The generated file is a private key/value data file and must not be sourced as shell code. Prefer `gsr-replay setup` over manual edits because the wizard validates every setting.
 
 Replay videos default to `~/Videos/replay`. The uninstaller never removes replay videos.
+When `GSR_REPLAY_REQUIRED_FS_UUID` is set by an integration, recording and
+saving fail closed unless that exact filesystem is mounted below the output
+directory. This prevents an unavailable external drive from redirecting clips
+onto the system disk.
 
 ## Troubleshooting
 

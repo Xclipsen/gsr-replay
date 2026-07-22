@@ -98,8 +98,13 @@ setup_case() {
 exit 0
 EOF
   chmod +x "$FAKE_BIN/omarchy" || fail "could not create fake omarchy"
+  cat >"$FAKE_BIN/omarchy-restart-waybar" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$FAKE_BIN/omarchy-restart-waybar" || fail "could not create fake Waybar restart helper"
   export HOME XDG_CONFIG_HOME PATH
-  unset FAKE_GSR_LOG FAKE_NOTIFY_LOG FAKE_SYSTEMCTL_LOG FAKE_SYSTEMCTL_STATE
+  unset FAKE_GSR_LOG FAKE_NOTIFY_LOG FAKE_SYSTEMCTL_LOG FAKE_SYSTEMCTL_STATE FAKE_SYSTEMCTL_FRAGMENT FAKE_SYSTEMCTL_DROPINS
 }
 
 make_fake_systemctl() {
@@ -119,6 +124,14 @@ if [[ "$*" == "--user is-failed --quiet gsr-replay.service" ]]; then
   [[ "${FAKE_SYSTEMCTL_STATE:-inactive}" == "failed" ]]
   exit
 fi
+if [[ "$*" == "--user show gsr-replay.service --property=FragmentPath --value" ]]; then
+  printf '%s\n' "${FAKE_SYSTEMCTL_FRAGMENT:-}"
+  exit 0
+fi
+if [[ "$*" == "--user show gsr-replay.service --property=DropInPaths --value" ]]; then
+  printf '%s\n' "${FAKE_SYSTEMCTL_DROPINS:-}"
+  exit 0
+fi
 exit 0
 EOF
   chmod +x "$FAKE_BIN/systemctl" || fail "could not create fake systemctl"
@@ -133,6 +146,14 @@ EOF
   chmod +x "$FAKE_BIN/notify-send" || fail "could not create fake notify-send"
 }
 
+make_fake_findmnt() {
+  cat >"$FAKE_BIN/findmnt" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "${FAKE_FINDMNT_UUID:-}"
+EOF
+  chmod +x "$FAKE_BIN/findmnt" || fail "could not create fake findmnt"
+}
+
 make_fake_recorder() {
   cat >"$FAKE_BIN/gpu-screen-recorder" <<'EOF'
 #!/usr/bin/env bash
@@ -140,6 +161,14 @@ set -u
 printf '<%s>\n' "$@" >"${FAKE_GSR_LOG:?}"
 EOF
   chmod +x "$FAKE_BIN/gpu-screen-recorder" || fail "could not create fake recorder"
+}
+
+install_expected_service() {
+  local service_path="$XDG_CONFIG_HOME/systemd/user/gsr-replay.service"
+  mkdir -p "$(dirname -- "$service_path")"
+  cp "$ROOT_DIR/systemd/gsr-replay.service" "$service_path"
+  FAKE_SYSTEMCTL_FRAGMENT="$service_path"
+  export FAKE_SYSTEMCTL_FRAGMENT
 }
 
 make_fake_omarchy() {
@@ -158,6 +187,7 @@ write_test_config() {
   local output_dir="${5:-$CASE_DIR/replays}"
   local storage="${6:-disk}"
   local bitrate="${7:-12345}"
+  local required_uuid="${8:-}"
   local config_dir="$XDG_CONFIG_HOME/gsr-replay"
 
   mkdir -p "$config_dir" || fail "could not create configuration directory"
@@ -171,6 +201,7 @@ write_test_config() {
     printf 'GSR_REPLAY_CODEC=%s\n' 'h264'
     printf 'GSR_REPLAY_STORAGE=%s\n' "$storage"
     printf 'GSR_REPLAY_DIR=%s\n' "$output_dir"
+    printf 'GSR_REPLAY_REQUIRED_FS_UUID=%s\n' "$required_uuid"
     printf 'GSR_REPLAY_NOTIFICATIONS=%s\n' "$notifications"
     printf 'GSR_REPLAY_WAYBAR_CONFIG=%s\n' ''
     printf 'GSR_REPLAY_WAYBAR_STYLE=%s\n' ''
@@ -250,7 +281,7 @@ test_help_and_version() {
   for argument in version --version -v; do
     run_capture "$BASH_BIN" "$CLI" "$argument"
     assert_eq 0 "$CAPTURE_STATUS" "version invocation failed for '$argument'"
-    assert_eq 'gsr-replay 1.0.0' "$CAPTURE_OUTPUT" "version output is incorrect for '$argument'"
+    assert_eq 'gsr-replay 1.1.0' "$CAPTURE_OUTPUT" "version output is incorrect for '$argument'"
   done
 }
 
@@ -377,6 +408,86 @@ test_oversized_ram_config() {
   [[ ! -e "$output_dir" ]] || fail "unsafe RAM validation occurred after creating the output directory"
 }
 
+test_required_output_filesystem() {
+  local recorder_log="$CASE_DIR/recorder-arguments"
+  local output_dir="$CASE_DIR/external/replays"
+  local callback_path="$HOME/.local/bin/gsr-replay-callback"
+
+  FAKE_GSR_LOG="$recorder_log"
+  export FAKE_GSR_LOG
+  make_fake_recorder
+  make_fake_findmnt
+  mkdir -p "$(dirname -- "$callback_path")" "$(dirname -- "$output_dir")"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$callback_path"
+  chmod +x "$callback_path"
+  write_test_config screen 120 none false "$output_dir" disk 12345 A1B2-C3D4
+
+  FAKE_FINDMNT_UUID=FFFF-0000
+  export FAKE_FINDMNT_UUID
+  run_capture "$BASH_BIN" "$CLI" run
+  assert_eq 1 "$CAPTURE_STATUS" "recording should fail on the wrong output filesystem"
+  [[ ! -e "$recorder_log" ]] || fail "recorder started on the wrong filesystem"
+
+  FAKE_FINDMNT_UUID=A1B2-C3D4
+  export FAKE_FINDMNT_UUID
+  run_capture "$BASH_BIN" "$CLI" run
+  assert_eq 0 "$CAPTURE_STATUS" "recording should start on the required filesystem: $CAPTURE_OUTPUT"
+  [[ -e "$recorder_log" ]] || fail "recorder did not start on the required filesystem"
+}
+
+test_output_verification_and_doctor() {
+  local output_dir="$CASE_DIR/external/replays"
+  local callback_path="$HOME/.local/bin/gsr-replay-callback"
+
+  make_fake_findmnt
+  make_fake_systemctl
+  install_expected_service
+  mkdir -p "$(dirname -- "$callback_path")" "$output_dir"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$callback_path"
+  chmod +x "$callback_path"
+  write_test_config portal 120 none false "$output_dir" disk 12345 A1B2-C3D4
+
+  FAKE_FINDMNT_UUID=FFFF-0000
+  FAKE_SYSTEMCTL_STATE=active
+  export FAKE_FINDMNT_UUID FAKE_SYSTEMCTL_STATE
+  run_capture "$BASH_BIN" "$CLI" verify-output "$output_dir" A1B2-C3D4
+  assert_eq 1 "$CAPTURE_STATUS" "verify-output should fail while required storage is absent"
+
+  run_capture "$BASH_BIN" "$CLI" doctor
+  assert_eq 1 "$CAPTURE_STATUS" "doctor should fail while required storage is absent"
+  assert_contains "$CAPTURE_OUTPUT" 'Output filesystem' "doctor omits the unavailable required filesystem"
+
+  run_capture "$BASH_BIN" "$CLI" status-json
+  assert_eq 0 "$CAPTURE_STATUS" "status-json should report unavailable storage without crashing"
+  assert_contains "$CAPTURE_OUTPUT" '"alt":"failed"' "status-json does not surface unavailable storage"
+
+  FAKE_FINDMNT_UUID=A1B2-C3D4
+  export FAKE_FINDMNT_UUID
+  run_capture "$BASH_BIN" "$CLI" verify-output "$output_dir" A1B2-C3D4
+  assert_eq 0 "$CAPTURE_STATUS" "verify-output should accept the configured mounted filesystem: $CAPTURE_OUTPUT"
+}
+
+test_missing_config_blocks_start_paths() {
+  make_fake_systemctl
+  make_fake_recorder
+  install_expected_service
+
+  run_capture "$BASH_BIN" "$CLI" run
+  assert_eq 1 "$CAPTURE_STATUS" "recorder run should require completed setup"
+  assert_contains "$CAPTURE_OUTPUT" 'No configuration found' "run omits the missing configuration error"
+
+  run_capture "$BASH_BIN" "$CLI" start
+  assert_eq 1 "$CAPTURE_STATUS" "service start should require completed setup"
+  assert_contains "$CAPTURE_OUTPUT" 'No configuration found' "start omits the missing configuration error"
+
+  run_capture "$BASH_BIN" "$CLI" status
+  assert_eq 1 "$CAPTURE_STATUS" "human status should fail without configuration"
+
+  run_capture "$BASH_BIN" "$CLI" status-json
+  assert_eq 0 "$CAPTURE_STATUS" "JSON status should remain machine-readable without configuration"
+  assert_contains "$CAPTURE_OUTPUT" '"alt":"failed"' "JSON status does not report missing setup"
+}
+
 test_save_active() {
   local systemctl_log="$CASE_DIR/systemctl.log"
   local notify_log="$CASE_DIR/notify.log"
@@ -390,12 +501,13 @@ test_save_active() {
   export FAKE_SYSTEMCTL_LOG FAKE_SYSTEMCTL_STATE FAKE_NOTIFY_LOG
   make_fake_systemctl
   make_fake_notify_send
+  install_expected_service
   write_test_config screen 120 default_output true "$CASE_DIR/replays"
 
   run_capture "$BASH_BIN" "$CLI" save
   assert_eq 0 "$CAPTURE_STATUS" "saving an active replay failed: $CAPTURE_OUTPUT"
   assert_eq 'Replay save requested.' "$CAPTURE_OUTPUT" "active save confirmation is incorrect"
-  assert_eq $'--user is-active --quiet gsr-replay.service\n--user kill --kill-whom=main --signal=SIGUSR1 gsr-replay.service' \
+  assert_eq $'--user show gsr-replay.service --property=FragmentPath --value\n--user show gsr-replay.service --property=DropInPaths --value\n--user is-active --quiet gsr-replay.service\n--user kill --kill-whom=main --signal=SIGUSR1 gsr-replay.service' \
     "$(<"$systemctl_log")" "active save sent incorrect systemctl commands"
   expected_notify="$(printf '<%s>\n' \
     '--app-name=GSR Replay' \
@@ -419,13 +531,14 @@ test_save_inactive() {
   export FAKE_SYSTEMCTL_LOG FAKE_SYSTEMCTL_STATE FAKE_NOTIFY_LOG
   make_fake_systemctl
   make_fake_notify_send
+  install_expected_service
   write_test_config screen 120 default_output true "$CASE_DIR/replays"
 
   run_capture "$BASH_BIN" "$CLI" save
   assert_eq 1 "$CAPTURE_STATUS" "saving an inactive replay should fail after starting it"
   assert_eq 'Error: Replay buffer was not running. It has been started; try again in a moment.' \
     "$CAPTURE_OUTPUT" "inactive save error is incorrect"
-  assert_eq $'--user is-active --quiet gsr-replay.service\n--user start gsr-replay.service' \
+  assert_eq $'--user show gsr-replay.service --property=FragmentPath --value\n--user show gsr-replay.service --property=DropInPaths --value\n--user is-active --quiet gsr-replay.service\n--user start gsr-replay.service' \
     "$(<"$systemctl_log")" "inactive save sent incorrect systemctl commands"
   expected_notify="$(printf '<%s>\n' \
     '--app-name=GSR Replay' \
@@ -492,6 +605,10 @@ test_waybar_json() {
   expected='{"text":"REC","alt":"active","tooltip":"Replay buffer is active\nDisplay: DP-\"1\\test\nBuffer: 2 minutes\nLeft-click: Save clip\nRight-click: Stop","class":"active"}'
   assert_eq "$expected" "$CAPTURE_OUTPUT" "active Waybar JSON is incorrect or improperly escaped"
 
+  run_capture "$BASH_BIN" "$CLI" status-json
+  assert_eq 0 "$CAPTURE_STATUS" "desktop-neutral JSON status failed: $CAPTURE_OUTPUT"
+  assert_eq "$expected" "$CAPTURE_OUTPUT" "status-json and the Waybar compatibility alias differ"
+
   FAKE_SYSTEMCTL_STATE=inactive
   export FAKE_SYSTEMCTL_STATE
   run_capture "$BASH_BIN" "$CLI" waybar
@@ -507,6 +624,81 @@ test_waybar_json() {
   assert_waybar_json "$CAPTURE_OUTPUT"
   expected='{"text":"REC","alt":"failed","tooltip":"Replay buffer failed\nRight-click: Start again","class":"failed"}'
   assert_eq "$expected" "$CAPTURE_OUTPUT" "failed Waybar JSON is incorrect"
+}
+
+test_service_fragment_mismatch() {
+  local expected_service="$XDG_CONFIG_HOME/systemd/user/gsr-replay.service"
+  local overriding_service="$CASE_DIR/legacy-gsr-replay.service"
+
+  make_fake_systemctl
+  mkdir -p "$(dirname -- "$expected_service")"
+  printf '[Service]\nExecStart=/bin/true\n' >"$expected_service"
+  printf '[Service]\nExecStart=/bin/false\n' >"$overriding_service"
+  FAKE_SYSTEMCTL_FRAGMENT="$overriding_service"
+  export FAKE_SYSTEMCTL_FRAGMENT
+  write_test_config screen 120 none false "$CASE_DIR/replays"
+
+  run_capture "$BASH_BIN" "$CLI" start
+  assert_eq 1 "$CAPTURE_STATUS" "a shadowing user unit should block service control"
+  assert_contains "$CAPTURE_OUTPUT" "The loaded user service is $overriding_service" \
+    "the shadowing unit error does not identify the effective fragment"
+  assert_contains "$CAPTURE_OUTPUT" "expects $expected_service" \
+    "the shadowing unit error does not identify the expected fragment"
+}
+
+test_service_dropin_mismatch() {
+  make_fake_systemctl
+  install_expected_service
+  FAKE_SYSTEMCTL_DROPINS="$CASE_DIR/override.conf"
+  export FAKE_SYSTEMCTL_DROPINS
+  write_test_config screen 120 none false "$CASE_DIR/replays"
+
+  run_capture "$BASH_BIN" "$CLI" start
+  assert_eq 1 "$CAPTURE_STATUS" "a service drop-in should block service control"
+  assert_contains "$CAPTURE_OUTPUT" "unsupported drop-ins: $FAKE_SYSTEMCTL_DROPINS" \
+    "the drop-in error does not identify the effective override"
+}
+
+test_status_json_rejects_arithmetic_injection() {
+  local marker="$CASE_DIR/arithmetic-injection-ran"
+  local seconds="BASH_VERSINFO[\$(touch $marker)0]"
+
+  make_fake_systemctl
+  write_test_config screen "$seconds" none false "$CASE_DIR/replays"
+  FAKE_SYSTEMCTL_STATE=active
+  export FAKE_SYSTEMCTL_STATE
+
+  run_capture "$BASH_BIN" "$CLI" status-json
+  assert_eq 1 "$CAPTURE_STATUS" "status-json should reject a non-integer duration"
+  [[ ! -e "$marker" ]] || fail "status-json executed arithmetic syntax from configuration"
+}
+
+test_status_json_handles_leading_zero_duration() {
+  make_fake_systemctl
+  write_test_config screen 0360 none false "$CASE_DIR/replays"
+  FAKE_SYSTEMCTL_STATE=active
+  export FAKE_SYSTEMCTL_STATE
+
+  run_capture "$BASH_BIN" "$CLI" status-json
+  assert_eq 0 "$CAPTURE_STATUS" "a decimal duration with leading zero should remain valid: $CAPTURE_OUTPUT"
+  assert_contains "$CAPTURE_OUTPUT" 'Buffer: 6 minutes' "duration was reinterpreted as octal"
+}
+
+test_status_json_rejects_control_characters() {
+  local monitor="DP-1"$'\b'"hidden"
+
+  make_fake_systemctl
+  write_test_config "$monitor" 120 none false "$CASE_DIR/replays"
+  FAKE_SYSTEMCTL_STATE=active
+  export FAKE_SYSTEMCTL_STATE
+
+  run_capture "$BASH_BIN" "$CLI" status-json
+  assert_eq 1 "$CAPTURE_STATUS" "status-json should reject C0 control characters"
+}
+
+test_recorder_uses_isolated_process_name() {
+  assert_file_contains "$CLI" 'exec -a gsr-replay-buffer gpu-screen-recorder' \
+    "replay recorder does not use its isolated process identity"
 }
 
 test_waybar_rejects_unsafe_layouts() {
@@ -823,16 +1015,25 @@ run_test() {
 }
 
 printf 'TAP version 13\n'
-printf '1..15\n'
+printf '1..24\n'
 run_test 'help and version commands' test_help_and_version
 run_test 'recorder argument construction and audio omission' test_recorder_arguments
 run_test 'portal recording restores its portal session' test_portal_recorder_arguments
 run_test 'config values are parsed as data without shell evaluation' test_config_values_are_data
 run_test 'unsafe oversized RAM buffers are rejected' test_oversized_ram_config
+run_test 'required output filesystem UUID is enforced' test_required_output_filesystem
+run_test 'output verification and doctor enforce required storage' test_output_verification_and_doctor
+run_test 'missing configuration blocks every start path' test_missing_config_blocks_start_paths
 run_test 'saving an active replay signals the recorder' test_save_active
 run_test 'saving an inactive replay starts the service' test_save_inactive
 run_test 'callback notifications respect file and config state' test_callback_notifications
 run_test 'Waybar emits valid active, inactive, and failed JSON' test_waybar_json
+run_test 'service control rejects a shadowing user unit' test_service_fragment_mismatch
+run_test 'service control rejects execution-changing drop-ins' test_service_dropin_mismatch
+run_test 'status-json rejects arithmetic injection in numeric config' test_status_json_rejects_arithmetic_injection
+run_test 'status-json treats leading-zero durations as decimal' test_status_json_handles_leading_zero_duration
+run_test 'status-json rejects JSON-breaking control characters' test_status_json_rejects_control_characters
+run_test 'recorder uses the replay-specific process identity' test_recorder_uses_isolated_process_name
 run_test 'Waybar rejects inline and multi-bar layouts without modification' test_waybar_rejects_unsafe_layouts
 run_test 'Waybar reinstall moves its managed module between positions' test_waybar_moves_managed_module
 run_test 'malformed Waybar CSS markers fail without truncation' test_malformed_css_markers_are_preserved
