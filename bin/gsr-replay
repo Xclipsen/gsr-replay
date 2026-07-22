@@ -19,7 +19,10 @@ else
 fi
 readonly WAYBAR_MODULE_PATH="$CONFIG_DIR/waybar.jsonc"
 readonly WAYBAR_MANIFEST_PATH="$CONFIG_DIR/waybar-install"
+readonly HYPRLAND_FRAGMENT_PATH="$CONFIG_DIR/hyprland.conf"
+readonly HYPRLAND_MANIFEST_PATH="$CONFIG_DIR/hyprland-install"
 readonly MAX_RAM_BUFFER_MIB=8192
+HYPRLAND_RELOAD_ERROR=""
 
 main() {
   local command="${1:-help}"
@@ -35,10 +38,13 @@ main() {
     config) show_config ;;
     run) run_recorder ;;
     saved) replay_saved "$@" ;;
-    status-json | waybar) status_json ;;
+    status-json) status_json "REC" ;;
+    waybar) status_json "●" ;;
     verify-output) verify_output "$@" ;;
     waybar-install) waybar_install_command "$@" ;;
     waybar-uninstall) waybar_uninstall_command "$@" ;;
+    hotkeys-install) hotkeys_install_command "$@" ;;
+    hotkeys-uninstall) hotkeys_uninstall_command "$@" ;;
     list-monitors) list_monitors ;;
     list-audio) list_audio ;;
     -v | --version | version) printf 'gsr-replay %s\n' "$VERSION" ;;
@@ -66,9 +72,11 @@ Commands:
   list-monitors       List capture displays
   list-audio          List audio sources
   status-json         Print machine-readable service status as JSON
-  waybar              Alias for status-json
+  waybar              Print Waybar status JSON with a dot indicator
   waybar-install      Install the Waybar integration
   waybar-uninstall    Remove the Waybar integration
+  hotkeys-install     Install Hyprland hotkeys
+  hotkeys-uninstall   Remove Hyprland hotkeys
   version             Print the installed version
   help                Show this help
 
@@ -92,6 +100,10 @@ set_defaults() {
   GSR_REPLAY_WAYBAR_STYLE="${GSR_REPLAY_WAYBAR_STYLE:-}"
   GSR_REPLAY_WAYBAR_POSITION="${GSR_REPLAY_WAYBAR_POSITION:-right}"
   GSR_REPLAY_WAYBAR_ENABLED="${GSR_REPLAY_WAYBAR_ENABLED:-false}"
+  GSR_REPLAY_HYPRLAND_CONFIG="${GSR_REPLAY_HYPRLAND_CONFIG:-}"
+  GSR_REPLAY_HYPRLAND_TOGGLE_BIND="${GSR_REPLAY_HYPRLAND_TOGGLE_BIND:-SUPER ALT, R}"
+  GSR_REPLAY_HYPRLAND_SAVE_BIND="${GSR_REPLAY_HYPRLAND_SAVE_BIND:-SUPER, C}"
+  GSR_REPLAY_HYPRLAND_ENABLED="${GSR_REPLAY_HYPRLAND_ENABLED:-false}"
 }
 
 load_config() {
@@ -101,7 +113,7 @@ load_config() {
     while IFS='=' read -r key value || [[ -n "$key" ]]; do
       [[ -z "$key" || "$key" == \#* ]] && continue
       case "$key" in
-        GSR_REPLAY_MONITOR | GSR_REPLAY_RESOLUTION | GSR_REPLAY_FPS | GSR_REPLAY_SECONDS | GSR_REPLAY_AUDIO | GSR_REPLAY_BITRATE | GSR_REPLAY_CODEC | GSR_REPLAY_STORAGE | GSR_REPLAY_DIR | GSR_REPLAY_REQUIRED_FS_UUID | GSR_REPLAY_NOTIFICATIONS | GSR_REPLAY_WAYBAR_CONFIG | GSR_REPLAY_WAYBAR_STYLE | GSR_REPLAY_WAYBAR_POSITION | GSR_REPLAY_WAYBAR_ENABLED)
+        GSR_REPLAY_MONITOR | GSR_REPLAY_RESOLUTION | GSR_REPLAY_FPS | GSR_REPLAY_SECONDS | GSR_REPLAY_AUDIO | GSR_REPLAY_BITRATE | GSR_REPLAY_CODEC | GSR_REPLAY_STORAGE | GSR_REPLAY_DIR | GSR_REPLAY_REQUIRED_FS_UUID | GSR_REPLAY_NOTIFICATIONS | GSR_REPLAY_WAYBAR_CONFIG | GSR_REPLAY_WAYBAR_STYLE | GSR_REPLAY_WAYBAR_POSITION | GSR_REPLAY_WAYBAR_ENABLED | GSR_REPLAY_HYPRLAND_CONFIG | GSR_REPLAY_HYPRLAND_TOGGLE_BIND | GSR_REPLAY_HYPRLAND_SAVE_BIND | GSR_REPLAY_HYPRLAND_ENABLED)
           printf -v "$key" '%s' "$value"
           ;;
         *) die "Unknown setting in $CONFIG_FILE: $key" ;;
@@ -110,6 +122,15 @@ load_config() {
   fi
   GSR_REPLAY_DIR="$(expand_home "$GSR_REPLAY_DIR")"
   apply_enforced_output
+}
+
+config_has_setting() {
+  local expected="$1" key value
+  [[ -f "$CONFIG_FILE" ]] || return 1
+  while IFS='=' read -r key value || [[ -n "$key" ]]; do
+    [[ "$key" == "$expected" ]] && return 0
+  done < "$CONFIG_FILE"
+  return 1
 }
 
 require_config() {
@@ -150,10 +171,15 @@ validate_config() {
   [[ "$GSR_REPLAY_STORAGE" == "ram" || "$GSR_REPLAY_STORAGE" == "disk" ]] || die "Replay storage must be ram or disk."
   [[ "$GSR_REPLAY_NOTIFICATIONS" == "true" || "$GSR_REPLAY_NOTIFICATIONS" == "false" ]] || die "Notifications must be true or false."
   [[ "$GSR_REPLAY_WAYBAR_ENABLED" == "true" || "$GSR_REPLAY_WAYBAR_ENABLED" == "false" ]] || die "Waybar integration must be true or false."
+  [[ "$GSR_REPLAY_HYPRLAND_ENABLED" == "true" || "$GSR_REPLAY_HYPRLAND_ENABLED" == "false" ]] || die "Hyprland hotkeys must be true or false."
   [[ -n "$GSR_REPLAY_DIR" ]] || die "Replay output directory cannot be empty."
   [[ "$GSR_REPLAY_DIR" == /* ]] || die "Replay output directory must be an absolute path."
   validate_text "Audio source" "$GSR_REPLAY_AUDIO"
   validate_text "Replay output directory" "$GSR_REPLAY_DIR"
+  validate_text "Hyprland config path" "$GSR_REPLAY_HYPRLAND_CONFIG"
+  hyprland_binding_valid "$GSR_REPLAY_HYPRLAND_TOGGLE_BIND" || die "Invalid Hyprland toggle binding: $GSR_REPLAY_HYPRLAND_TOGGLE_BIND"
+  hyprland_binding_valid "$GSR_REPLAY_HYPRLAND_SAVE_BIND" || die "Invalid Hyprland save binding: $GSR_REPLAY_HYPRLAND_SAVE_BIND"
+  [[ "$(normalize_hyprland_binding "$GSR_REPLAY_HYPRLAND_TOGGLE_BIND")" != "$(normalize_hyprland_binding "$GSR_REPLAY_HYPRLAND_SAVE_BIND")" ]] || die "Hyprland toggle and save bindings must be different."
   [[ -z "$GSR_REPLAY_REQUIRED_FS_UUID" || "$GSR_REPLAY_REQUIRED_FS_UUID" =~ ^[A-Fa-f0-9-]+$ ]] || die "Required filesystem UUID contains unsupported characters."
   if [[ "$GSR_REPLAY_STORAGE" == "ram" ]] && (( $(estimated_buffer_mib) > MAX_RAM_BUFFER_MIB )); then
     die "The estimated RAM buffer exceeds ${MAX_RAM_BUFFER_MIB} MiB. Choose disk storage or lower the duration/bitrate."
@@ -483,6 +509,10 @@ setup() {
   systemctl --user daemon-reload
   verify_service_unit
   load_config
+  local previous_hyprland_config="$GSR_REPLAY_HYPRLAND_CONFIG"
+  local previous_hyprland_toggle_bind="$GSR_REPLAY_HYPRLAND_TOGGLE_BIND"
+  local previous_hyprland_save_bind="$GSR_REPLAY_HYPRLAND_SAVE_BIND"
+  local previous_hyprland_enabled="$GSR_REPLAY_HYPRLAND_ENABLED"
 
   printf '\nGSR Replay setup\n'
   printf '================\n'
@@ -500,23 +530,54 @@ setup() {
   apply_enforced_output
   ask_yes_no GSR_REPLAY_NOTIFICATIONS "Show desktop notifications?" "$GSR_REPLAY_NOTIFICATIONS"
 
-  local autostart start_now waybar_enabled waybar_was_installed=false autostart_default=false waybar_default=true
+  local autostart start_now waybar_enabled hotkeys_enabled
+  local waybar_was_installed=false hotkeys_were_installed=false
+  local autostart_default=false waybar_default=true hotkeys_default=false
   systemctl --user is-enabled --quiet "$SERVICE_NAME" && autostart_default=true
   [[ -f "$WAYBAR_MANIFEST_PATH" ]] && waybar_was_installed=true
-  [[ -f "$CONFIG_FILE" ]] && waybar_default="$GSR_REPLAY_WAYBAR_ENABLED"
+  if [[ -f "$HYPRLAND_MANIFEST_PATH" ]]; then
+    hotkeys_were_installed=true
+    hotkeys_default=true
+  fi
+  if [[ -f "$CONFIG_FILE" ]]; then
+    waybar_default="$GSR_REPLAY_WAYBAR_ENABLED"
+    if [[ "$hotkeys_were_installed" == "false" ]] && config_has_setting GSR_REPLAY_HYPRLAND_ENABLED; then
+      hotkeys_default="$GSR_REPLAY_HYPRLAND_ENABLED"
+    fi
+  fi
   ask_yes_no autostart "Start the replay buffer automatically with your desktop session?" "$autostart_default"
 
   waybar_enabled="$waybar_default"
-  if [[ -f "${GSR_REPLAY_WAYBAR_CONFIG:-$(default_waybar_config)}" && -f "${GSR_REPLAY_WAYBAR_STYLE:-$(default_waybar_style)}" ]]; then
+  if [[ -f "$(expand_home "${GSR_REPLAY_WAYBAR_CONFIG:-$(default_waybar_config)}")" && -f "$(expand_home "${GSR_REPLAY_WAYBAR_STYLE:-$(default_waybar_style)}")" ]]; then
     ask_yes_no waybar_enabled "Install the Waybar status module?" "$waybar_default"
     if [[ "$waybar_enabled" == "true" ]]; then
       configure_waybar_paths
     fi
   elif command -v waybar >/dev/null 2>&1; then
+    waybar_enabled=false
     printf 'Waybar was detected, but its default config or stylesheet was not found. Skipping integration.\n'
+  else
+    waybar_enabled=false
   fi
   GSR_REPLAY_WAYBAR_ENABLED="$waybar_enabled"
 
+  hotkeys_enabled="$hotkeys_default"
+  if [[ -f "$(expand_home "${GSR_REPLAY_HYPRLAND_CONFIG:-$(default_hyprland_config)}")" ]]; then
+    ask_yes_no hotkeys_enabled "Install configurable Hyprland hotkeys?" "$hotkeys_default"
+    if [[ "$hotkeys_enabled" == "true" ]]; then
+      configure_hyprland_hotkeys
+    fi
+  elif command -v hyprctl >/dev/null 2>&1; then
+    hotkeys_enabled=false
+    printf 'Hyprland was detected, but its default config was not found. Skipping hotkeys.\n'
+  else
+    hotkeys_enabled=false
+  fi
+  GSR_REPLAY_HYPRLAND_ENABLED="$hotkeys_enabled"
+
+  if [[ "$hotkeys_enabled" == "true" ]]; then
+    preflight_hyprland_install "$GSR_REPLAY_HYPRLAND_CONFIG" "$GSR_REPLAY_HYPRLAND_TOGGLE_BIND" "$GSR_REPLAY_HYPRLAND_SAVE_BIND"
+  fi
   validate_config
   prepare_output_dir
   write_config
@@ -546,10 +607,30 @@ setup() {
     write_config
   fi
 
+  if [[ "$hotkeys_enabled" == "true" ]]; then
+    if ! install_hyprland_hotkeys "$GSR_REPLAY_HYPRLAND_CONFIG" "$GSR_REPLAY_HYPRLAND_TOGGLE_BIND" "$GSR_REPLAY_HYPRLAND_SAVE_BIND"; then
+      GSR_REPLAY_HYPRLAND_CONFIG="$previous_hyprland_config"
+      GSR_REPLAY_HYPRLAND_TOGGLE_BIND="$previous_hyprland_toggle_bind"
+      GSR_REPLAY_HYPRLAND_SAVE_BIND="$previous_hyprland_save_bind"
+      GSR_REPLAY_HYPRLAND_ENABLED="$previous_hyprland_enabled"
+      write_config
+      die "$HYPRLAND_RELOAD_ERROR The previous Hyprland configuration was restored."
+    fi
+  elif [[ "$hotkeys_were_installed" == "true" ]]; then
+    hotkeys_uninstall_command
+    GSR_REPLAY_HYPRLAND_CONFIG=""
+    GSR_REPLAY_HYPRLAND_ENABLED=false
+    write_config
+  fi
+
   printf '\nSetup complete.\n'
   printf '  Display:  %s\n' "$GSR_REPLAY_MONITOR"
   printf '  Replay:   %s at %s FPS, last %s\n' "$GSR_REPLAY_RESOLUTION" "$GSR_REPLAY_FPS" "$(format_duration "$GSR_REPLAY_SECONDS")"
   printf '  Output:   %s\n' "$GSR_REPLAY_DIR"
+  if [[ "$hotkeys_enabled" == "true" ]]; then
+    printf '  Toggle:   %s\n' "$GSR_REPLAY_HYPRLAND_TOGGLE_BIND"
+    printf '  Save:     %s\n' "$GSR_REPLAY_HYPRLAND_SAVE_BIND"
+  fi
   printf '\nUse "gsr-replay save" to save a clip and "gsr-replay doctor" to verify the installation.\n'
 }
 
@@ -720,6 +801,52 @@ validate_nonempty() {
   return 1
 }
 
+hyprland_binding_valid() {
+  local binding="$1" modifiers key modifier
+  [[ ! "$binding" =~ [[:cntrl:]] ]] || return 1
+  [[ "$binding" == *,* && "${binding#*,}" != *,* ]] || return 1
+  modifiers="$(trim_whitespace "${binding%%,*}")"
+  key="$(trim_whitespace "${binding#*,}")"
+  [[ -n "$modifiers" && -n "$key" ]] || return 1
+  [[ "$key" =~ ^([[:alnum:]_.+-]+|code:[0-9]+)$ ]] || return 1
+  for modifier in $modifiers; do
+    case "${modifier^^}" in
+      SUPER | SHIFT | CTRL | ALT | MOD2 | MOD3 | MOD5) ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+normalize_hyprland_binding() {
+  local binding="$1" modifiers key modifier canonical normalized=""
+  modifiers="$(trim_whitespace "${binding%%,*}")"
+  key="$(trim_whitespace "${binding#*,}")"
+  modifiers=" ${modifiers^^} "
+  for canonical in SUPER SHIFT CTRL ALT MOD2 MOD3 MOD5; do
+    if [[ "$modifiers" == *" $canonical "* ]]; then
+      normalized+="${normalized:+ }$canonical"
+    fi
+  done
+  if [[ "$key" == code:* ]]; then
+    key="${key#code:}"
+    while [[ "${#key}" -gt 1 && "$key" == 0* ]]; do
+      key="${key#0}"
+    done
+    key="code:$key"
+  else
+    key="${key^^}"
+  fi
+  printf '%s, %s\n' "$normalized" "$key"
+}
+
+validate_hyprland_binding_value() {
+  if hyprland_binding_valid "$1"; then
+    return 0
+  fi
+  printf 'Use Hyprland syntax such as SUPER ALT, R.\n'
+  return 1
+}
+
 write_config() {
   mkdir -p "$CONFIG_DIR"
   local temp
@@ -742,6 +869,10 @@ write_config() {
     write_setting GSR_REPLAY_WAYBAR_STYLE "$GSR_REPLAY_WAYBAR_STYLE"
     write_setting GSR_REPLAY_WAYBAR_POSITION "$GSR_REPLAY_WAYBAR_POSITION"
     write_setting GSR_REPLAY_WAYBAR_ENABLED "$GSR_REPLAY_WAYBAR_ENABLED"
+    write_setting GSR_REPLAY_HYPRLAND_CONFIG "$GSR_REPLAY_HYPRLAND_CONFIG"
+    write_setting GSR_REPLAY_HYPRLAND_TOGGLE_BIND "$GSR_REPLAY_HYPRLAND_TOGGLE_BIND"
+    write_setting GSR_REPLAY_HYPRLAND_SAVE_BIND "$GSR_REPLAY_HYPRLAND_SAVE_BIND"
+    write_setting GSR_REPLAY_HYPRLAND_ENABLED "$GSR_REPLAY_HYPRLAND_ENABLED"
   } > "$temp"
   mv "$temp" "$CONFIG_FILE"
 }
@@ -766,6 +897,17 @@ configure_waybar_paths() {
   GSR_REPLAY_WAYBAR_POSITION="$selected"
 }
 
+configure_hyprland_hotkeys() {
+  local default_config
+  default_config="${GSR_REPLAY_HYPRLAND_CONFIG:-$(default_hyprland_config)}"
+  ask_text GSR_REPLAY_HYPRLAND_CONFIG "Hyprland config file" "$default_config" validate_existing_file
+  ask_text GSR_REPLAY_HYPRLAND_TOGGLE_BIND "Start/stop hotkey" "$GSR_REPLAY_HYPRLAND_TOGGLE_BIND" validate_hyprland_binding_value
+  ask_text GSR_REPLAY_HYPRLAND_SAVE_BIND "Save replay hotkey" "$GSR_REPLAY_HYPRLAND_SAVE_BIND" validate_hyprland_binding_value
+  GSR_REPLAY_HYPRLAND_TOGGLE_BIND="$(normalize_hyprland_binding "$GSR_REPLAY_HYPRLAND_TOGGLE_BIND")"
+  GSR_REPLAY_HYPRLAND_SAVE_BIND="$(normalize_hyprland_binding "$GSR_REPLAY_HYPRLAND_SAVE_BIND")"
+  [[ "$GSR_REPLAY_HYPRLAND_TOGGLE_BIND" != "$GSR_REPLAY_HYPRLAND_SAVE_BIND" ]] || die "Hyprland toggle and save bindings must be different."
+}
+
 validate_existing_file() {
   if [[ -f "$(expand_home "$1")" ]]; then
     return 0
@@ -784,6 +926,10 @@ default_waybar_config() {
 
 default_waybar_style() {
   printf '%s\n' "$CONFIG_HOME/waybar/style.css"
+}
+
+default_hyprland_config() {
+  printf '%s\n' "$CONFIG_HOME/hypr/hyprland.conf"
 }
 
 waybar_install_command() {
@@ -842,6 +988,7 @@ write_waybar_module() {
 patch_waybar_config() {
   local config="$1" position="$2" line trimmed base temp
   local root_found=false include_present=false module_inserted=false include_inserted=false
+  local scanning_target=false target_open=false tray_anchor=false
   base="$(mktemp "$(dirname "$config")/.gsr-replay-base.XXXXXX")"
   temp="$(mktemp "$(dirname "$config")/.gsr-replay-config.XXXXXX")"
   trap 'rm -f -- "$base" "$temp"' RETURN
@@ -851,6 +998,13 @@ patch_waybar_config() {
   while IFS= read -r line || [[ -n "$line" ]]; do
     trimmed="$(trim_whitespace "$line")"
     [[ "$trimmed" =~ ^\"include\"[[:space:]]*:[[:space:]]*\[[[:space:]]*$ ]] && include_present=true
+    if [[ "$trimmed" =~ ^\"modules-$position\"[[:space:]]*:[[:space:]]*\[[[:space:]]*$ ]]; then
+      scanning_target=true
+    elif [[ "$scanning_target" == "true" && "$trimmed" =~ ^\],?$ ]]; then
+      scanning_target=false
+    elif [[ "$scanning_target" == "true" && "$position" == "right" && "$trimmed" =~ ^\"group/tray-expander\"[[:space:]]*,?$ ]]; then
+      tray_anchor=true
+    fi
   done < "$base"
 
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -880,12 +1034,20 @@ patch_waybar_config() {
     fi
 
     if [[ "$module_inserted" == "false" && "$trimmed" =~ ^\"modules-$position\"[[:space:]]*:[[:space:]]*\[[[:space:]]*$ ]]; then
-      {
-        printf '    // gsr-replay:module-start\n'
-        printf '    "custom/gsr-replay",\n'
-        printf '    // gsr-replay:module-end\n'
-      } >> "$temp"
+      if [[ "$tray_anchor" == "true" ]]; then
+        target_open=true
+      else
+        write_waybar_module_block "$temp"
+        module_inserted=true
+      fi
+    elif [[ "$target_open" == "true" && "$trimmed" =~ ^\"group/tray-expander\"[[:space:]]*,?$ ]]; then
+      if [[ "$trimmed" == *, ]]; then
+        write_waybar_module_block "$temp" false
+      else
+        write_waybar_module_block "$temp" true
+      fi
       module_inserted=true
+      target_open=false
     fi
   done < "$base"
 
@@ -900,6 +1062,16 @@ patch_waybar_config() {
   mv "$temp" "$config"
   rm -f "$base"
   trap - RETURN
+}
+
+write_waybar_module_block() {
+  local destination="$1" leading_comma="${2:-false}"
+  {
+    printf '    // gsr-replay:module-start\n'
+    [[ "$leading_comma" == "false" ]] || printf '    ,\n'
+    printf '    "custom/gsr-replay",\n'
+    printf '    // gsr-replay:module-end\n'
+  } >> "$destination"
 }
 
 preflight_waybar_target() {
@@ -972,23 +1144,44 @@ strip_waybar_blocks() {
 }
 
 patch_waybar_style() {
-  local style="$1" temp start_count
+  local style="$1" line temp start_count skipping=false
   preflight_waybar_style "$style"
   start_count="$(count_exact_lines "$style" '/* gsr-replay:start */')"
-  if [[ "$start_count" -eq 1 ]]; then
-    return
-  fi
   temp="$(mktemp "$(dirname "$style")/.gsr-replay-style.XXXXXX")"
   chmod --reference="$style" "$temp" 2>/dev/null || chmod 600 "$temp"
   while IFS= read -r line || [[ -n "$line" ]]; do
-    printf '%s\n' "$line" >> "$temp"
+    if [[ "$line" == '/* gsr-replay:start */' ]]; then
+      write_waybar_style_block "$temp"
+      skipping=true
+      continue
+    fi
+    if [[ "$line" == '/* gsr-replay:end */' ]]; then
+      skipping=false
+      continue
+    fi
+    [[ "$skipping" == "false" ]] && printf '%s\n' "$line" >> "$temp"
   done < "$style"
-  cat >> "$temp" <<'EOF'
+  if [[ "$start_count" -eq 0 ]]; then
+    printf '\n' >> "$temp"
+    write_waybar_style_block "$temp"
+  fi
+  if cmp -s "$style" "$temp"; then
+    rm -f "$temp"
+    return
+  fi
+  backup_file "$style"
+  mv "$temp" "$style"
+}
 
+write_waybar_style_block() {
+  local destination="$1"
+  cat >> "$destination" <<'EOF'
 /* gsr-replay:start */
 #custom-gsr-replay {
-  margin: 0 6px;
-  font-weight: bold;
+  min-width: 18px;
+  margin: 0 2px 0 0;
+  padding: 0;
+  font-size: 13px;
 }
 
 #custom-gsr-replay.active {
@@ -996,7 +1189,7 @@ patch_waybar_style() {
 }
 
 #custom-gsr-replay.inactive {
-  opacity: 0.45;
+  color: #808080;
 }
 
 #custom-gsr-replay.failed {
@@ -1004,16 +1197,24 @@ patch_waybar_style() {
 }
 /* gsr-replay:end */
 EOF
-  backup_file "$style"
-  mv "$temp" "$style"
 }
 
 preflight_waybar_style() {
-  local style="$1" start_count end_count
+  local style="$1" line start_count end_count skipping=false
   start_count="$(count_exact_lines "$style" '/* gsr-replay:start */')"
   end_count="$(count_exact_lines "$style" '/* gsr-replay:end */')"
   [[ "$start_count" == "$end_count" ]] || die "Malformed gsr-replay CSS markers in $style; no changes were made."
   [[ "$start_count" -le 1 ]] || die "Multiple gsr-replay CSS blocks found in $style."
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == '/* gsr-replay:start */' ]]; then
+      [[ "$skipping" == "false" ]] || die "Malformed gsr-replay CSS markers in $style; no changes were made."
+      skipping=true
+    elif [[ "$line" == '/* gsr-replay:end */' ]]; then
+      [[ "$skipping" == "true" ]] || die "Malformed gsr-replay CSS markers in $style; no changes were made."
+      skipping=false
+    fi
+  done < "$style"
+  [[ "$skipping" == "false" ]] || die "Malformed gsr-replay CSS markers in $style; no changes were made."
 }
 
 refuse_waybar_retarget() {
@@ -1106,6 +1307,364 @@ write_waybar_manifest() {
   mv "$temp" "$WAYBAR_MANIFEST_PATH"
 }
 
+hotkeys_install_command() {
+  load_config
+  local config="${1:-$GSR_REPLAY_HYPRLAND_CONFIG}"
+  local toggle_binding="${2:-$GSR_REPLAY_HYPRLAND_TOGGLE_BIND}"
+  local save_binding="${3:-$GSR_REPLAY_HYPRLAND_SAVE_BIND}"
+  [[ -n "$config" ]] || die "Usage: gsr-replay hotkeys-install <hyprland-config> [toggle-binding] [save-binding]"
+  if ! install_hyprland_hotkeys "$config" "$toggle_binding" "$save_binding"; then
+    die "$HYPRLAND_RELOAD_ERROR The previous Hyprland configuration was restored."
+  fi
+}
+
+install_hyprland_hotkeys() {
+  local config toggle_binding="$2" save_binding="$3" previous_errors
+  local config_snapshot fragment_snapshot="" manifest_snapshot="" transaction_active=false
+  local had_fragment=false had_manifest=false
+  preflight_hyprland_install "$1" "$toggle_binding" "$save_binding"
+  config="$(canonical_file "$(expand_home "$1")")"
+  toggle_binding="$(normalize_hyprland_binding "$toggle_binding")"
+  save_binding="$(normalize_hyprland_binding "$save_binding")"
+
+  previous_errors="$(hyprland_config_errors)"
+  if ! mkdir -p "$CONFIG_DIR"; then
+    HYPRLAND_RELOAD_ERROR="Could not create the gsr-replay configuration directory."
+    return 1
+  fi
+  if ! config_snapshot="$(mktemp "$(dirname "$config")/.gsr-replay-hyprland-rollback.XXXXXX")"; then
+    HYPRLAND_RELOAD_ERROR="Could not create a Hyprland config snapshot."
+    return 1
+  fi
+  rm -f "$config_snapshot"
+  if ! cp -a "$config" "$config_snapshot"; then
+    HYPRLAND_RELOAD_ERROR="Could not snapshot the Hyprland config."
+    return 1
+  fi
+  if [[ -f "$HYPRLAND_FRAGMENT_PATH" ]]; then
+    had_fragment=true
+    if ! fragment_snapshot="$(mktemp "$CONFIG_DIR/.hyprland-rollback.XXXXXX")"; then
+      rm -f "$config_snapshot"
+      HYPRLAND_RELOAD_ERROR="Could not create a hotkey fragment snapshot."
+      return 1
+    fi
+    rm -f "$fragment_snapshot"
+    if ! cp -a "$HYPRLAND_FRAGMENT_PATH" "$fragment_snapshot"; then
+      rm -f "$config_snapshot"
+      HYPRLAND_RELOAD_ERROR="Could not snapshot the hotkey fragment."
+      return 1
+    fi
+  fi
+  if [[ -f "$HYPRLAND_MANIFEST_PATH" ]]; then
+    had_manifest=true
+    if ! manifest_snapshot="$(mktemp "$CONFIG_DIR/.hyprland-install-rollback.XXXXXX")"; then
+      rm -f "$config_snapshot" "$fragment_snapshot"
+      HYPRLAND_RELOAD_ERROR="Could not create a hotkey manifest snapshot."
+      return 1
+    fi
+    rm -f "$manifest_snapshot"
+    if ! cp -a "$HYPRLAND_MANIFEST_PATH" "$manifest_snapshot"; then
+      rm -f "$config_snapshot" "$fragment_snapshot"
+      HYPRLAND_RELOAD_ERROR="Could not snapshot the hotkey manifest."
+      return 1
+    fi
+  fi
+  transaction_active=true
+  trap 'if [[ "$transaction_active" == "true" ]]; then restore_hyprland_transaction "$config" "$config_snapshot" "$had_fragment" "$fragment_snapshot" "$had_manifest" "$manifest_snapshot"; fi' EXIT
+
+  local write_status
+  set +e
+  (
+    write_hyprland_fragment "$toggle_binding" "$save_binding" || exit 1
+    patch_hyprland_config "$config" || exit 1
+    write_hyprland_manifest "$config" || exit 1
+  )
+  write_status=$?
+  set -e
+  if ((write_status != 0)); then
+    HYPRLAND_RELOAD_ERROR="Could not write the Hyprland hotkey integration."
+    restore_hyprland_transaction "$config" "$config_snapshot" "$had_fragment" "$fragment_snapshot" "$had_manifest" "$manifest_snapshot"
+    transaction_active=false
+    trap - EXIT
+    return 1
+  fi
+  if ! reload_hyprland "$previous_errors"; then
+    restore_hyprland_transaction "$config" "$config_snapshot" "$had_fragment" "$fragment_snapshot" "$had_manifest" "$manifest_snapshot"
+    transaction_active=false
+    trap - EXIT
+    return 1
+  fi
+  transaction_active=false
+  trap - EXIT
+  rm -f "$config_snapshot" "$fragment_snapshot" "$manifest_snapshot"
+  printf 'Hyprland hotkeys installed in %s.\n' "$config"
+}
+
+restore_hyprland_transaction() {
+  local config="$1" config_snapshot="$2" had_fragment="$3" fragment_snapshot="$4" had_manifest="$5" manifest_snapshot="$6"
+  local restore_failed=false
+  if ! mv -f "$config_snapshot" "$config"; then
+    printf 'Warning: Hyprland config rollback remains at %s.\n' "$config_snapshot" >&2
+    restore_failed=true
+  fi
+  if [[ "$had_fragment" == "true" ]]; then
+    if ! mv -f "$fragment_snapshot" "$HYPRLAND_FRAGMENT_PATH"; then
+      printf 'Warning: Hotkey fragment rollback remains at %s.\n' "$fragment_snapshot" >&2
+      restore_failed=true
+    fi
+  else
+    rm -f "$HYPRLAND_FRAGMENT_PATH"
+  fi
+  if [[ "$had_manifest" == "true" ]]; then
+    if ! mv -f "$manifest_snapshot" "$HYPRLAND_MANIFEST_PATH"; then
+      printf 'Warning: Hotkey manifest rollback remains at %s.\n' "$manifest_snapshot" >&2
+      restore_failed=true
+    fi
+  else
+    rm -f "$HYPRLAND_MANIFEST_PATH"
+  fi
+  if command -v hyprctl >/dev/null 2>&1; then
+    hyprctl reload >/dev/null 2>&1 || true
+  fi
+  [[ "$restore_failed" == "false" ]] || printf 'Warning: Automatic Hyprland rollback was incomplete.\n' >&2
+}
+
+preflight_hyprland_install() {
+  local config toggle_binding="$2" save_binding="$3"
+  config="$(canonical_file "$(expand_home "$1")")"
+  reject_managed_omarchy_path "$config"
+  validate_text "Hyprland config path" "$config"
+  validate_text "gsr-replay executable path" "$CLI_PATH"
+  validate_text "Hyprland toggle binding" "$toggle_binding"
+  validate_text "Hyprland save binding" "$save_binding"
+  [[ "$HYPRLAND_FRAGMENT_PATH" != *'#'* ]] || die "Hyprland integration does not support # in its generated config path."
+  hyprland_binding_valid "$toggle_binding" || die "Invalid Hyprland toggle binding: $toggle_binding"
+  hyprland_binding_valid "$save_binding" || die "Invalid Hyprland save binding: $save_binding"
+  [[ "$(normalize_hyprland_binding "$toggle_binding")" != "$(normalize_hyprland_binding "$save_binding")" ]] || die "Hyprland toggle and save bindings must be different."
+  refuse_hyprland_retarget "$config"
+  preflight_hyprland_config "$config"
+}
+
+write_hyprland_fragment() {
+  local toggle_binding="$1" save_binding="$2" temp cli
+  local toggle_modifiers toggle_key save_modifiers save_key
+  mkdir -p "$CONFIG_DIR" || return 1
+  temp="$(mktemp "$CONFIG_DIR/.hyprland.XXXXXX")" || return 1
+  printf -v cli '%q' "$CLI_PATH"
+  toggle_modifiers="$(trim_whitespace "${toggle_binding%%,*}")"
+  toggle_key="$(trim_whitespace "${toggle_binding#*,}")"
+  save_modifiers="$(trim_whitespace "${save_binding%%,*}")"
+  save_key="$(trim_whitespace "${save_binding#*,}")"
+  {
+    printf '# Generated by gsr-replay setup. Run the wizard again to update it.\n'
+    printf 'unbind = %s, %s\n' "$toggle_modifiers" "$toggle_key"
+    printf 'bindd = %s, %s, Toggle replay buffer, exec, %s toggle\n' "$toggle_modifiers" "$toggle_key" "$cli"
+    printf '\n'
+    printf 'unbind = %s, %s\n' "$save_modifiers" "$save_key"
+    printf 'bindd = %s, %s, Save replay clip, exec, %s save\n' "$save_modifiers" "$save_key" "$cli"
+  } > "$temp" || {
+    rm -f "$temp"
+    return 1
+  }
+  chmod 600 "$temp" || {
+    rm -f "$temp"
+    return 1
+  }
+  mv "$temp" "$HYPRLAND_FRAGMENT_PATH"
+}
+
+preflight_hyprland_config() {
+  local config="$1" line trimmed skipping=false start_count end_count
+  start_count="$(count_exact_lines "$config" '# gsr-replay:hotkeys-start')"
+  end_count="$(count_exact_lines "$config" '# gsr-replay:hotkeys-end')"
+  [[ "$start_count" == "$end_count" ]] || die "Malformed gsr-replay hotkey markers in $config; no changes were made."
+  [[ "$start_count" -le 1 ]] || die "Multiple gsr-replay hotkey blocks found in $config."
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      '# gsr-replay:hotkeys-start')
+        [[ "$skipping" == "false" ]] || die "Malformed gsr-replay hotkey markers in $config; no changes were made."
+        skipping=true
+        continue
+        ;;
+      '# gsr-replay:hotkeys-end')
+        [[ "$skipping" == "true" ]] || die "Malformed gsr-replay hotkey markers in $config; no changes were made."
+        skipping=false
+        continue
+        ;;
+    esac
+    trimmed="$(trim_whitespace "$line")"
+    if [[ "$skipping" == "false" && "$trimmed" == "source = $HYPRLAND_FRAGMENT_PATH" ]]; then
+      die "An unmanaged gsr-replay Hyprland source already exists in $config."
+    fi
+  done < "$config"
+  [[ "$skipping" == "false" ]] || die "Malformed gsr-replay hotkey markers in $config; no changes were made."
+}
+
+patch_hyprland_config() {
+  local config="$1" line temp start_count skipping=false
+  preflight_hyprland_config "$config"
+  start_count="$(count_exact_lines "$config" '# gsr-replay:hotkeys-start')"
+  temp="$(mktemp "$(dirname "$config")/.gsr-replay-hyprland.XXXXXX")" || return 1
+  chmod --reference="$config" "$temp" 2>/dev/null || chmod 600 "$temp" || {
+    rm -f "$temp"
+    return 1
+  }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == '# gsr-replay:hotkeys-start' ]]; then
+      write_hyprland_source_block "$temp" || {
+        rm -f "$temp"
+        return 1
+      }
+      skipping=true
+      continue
+    fi
+    if [[ "$line" == '# gsr-replay:hotkeys-end' ]]; then
+      skipping=false
+      continue
+    fi
+    if [[ "$skipping" == "false" ]] && ! printf '%s\n' "$line" >> "$temp"; then
+      rm -f "$temp"
+      return 1
+    fi
+  done < "$config"
+  if [[ "$start_count" -eq 0 ]]; then
+    printf '\n' >> "$temp" || {
+      rm -f "$temp"
+      return 1
+    }
+    write_hyprland_source_block "$temp" || {
+      rm -f "$temp"
+      return 1
+    }
+  fi
+  if cmp -s "$config" "$temp"; then
+    rm -f "$temp"
+    return
+  fi
+  backup_file "$config" || {
+    rm -f "$temp"
+    return 1
+  }
+  mv "$temp" "$config"
+}
+
+write_hyprland_source_block() {
+  local destination="$1"
+  {
+    printf '# gsr-replay:hotkeys-start\n'
+    printf 'source = %s\n' "$HYPRLAND_FRAGMENT_PATH"
+    printf '# gsr-replay:hotkeys-end\n'
+  } >> "$destination"
+}
+
+refuse_hyprland_retarget() {
+  local config="$1" installed_config=""
+  [[ -f "$HYPRLAND_MANIFEST_PATH" ]] || return 0
+  IFS= read -r installed_config < "$HYPRLAND_MANIFEST_PATH" || true
+  if [[ "$installed_config" != "$config" ]]; then
+    die "Hyprland hotkeys are installed in a different file. Run 'gsr-replay hotkeys-uninstall' before changing targets."
+  fi
+}
+
+hotkeys_uninstall_command() {
+  load_config
+  local config="${1:-}" previous_errors integration_present=false
+  [[ -f "$HYPRLAND_FRAGMENT_PATH" || -f "$HYPRLAND_MANIFEST_PATH" ]] && integration_present=true
+  previous_errors="$(hyprland_config_errors)"
+  if [[ -z "$config" && -f "$HYPRLAND_MANIFEST_PATH" ]]; then
+    IFS= read -r config < "$HYPRLAND_MANIFEST_PATH" || true
+  fi
+  config="${config:-$GSR_REPLAY_HYPRLAND_CONFIG}"
+  if [[ -n "$config" ]]; then
+    if [[ -f "$(expand_home "$config")" ]]; then
+      remove_hyprland_config "$(realpath "$(expand_home "$config")")"
+    elif [[ "$integration_present" == "true" ]]; then
+      die "Hyprland config no longer exists: $config. Restore it before removing the hotkey integration."
+    fi
+  fi
+  rm -f "$HYPRLAND_FRAGMENT_PATH" "$HYPRLAND_MANIFEST_PATH"
+  reload_hyprland "$previous_errors" warn
+  printf 'Hyprland hotkeys removed.\n'
+}
+
+remove_hyprland_config() {
+  local config="$1" line temp skipping=false
+  preflight_hyprland_config "$config"
+  [[ "$(count_exact_lines "$config" '# gsr-replay:hotkeys-start')" -eq 1 ]] || return 0
+  temp="$(mktemp "$(dirname "$config")/.gsr-replay-hyprland.XXXXXX")"
+  chmod --reference="$config" "$temp" 2>/dev/null || chmod 600 "$temp"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == '# gsr-replay:hotkeys-start' ]]; then
+      skipping=true
+      continue
+    fi
+    if [[ "$line" == '# gsr-replay:hotkeys-end' ]]; then
+      skipping=false
+      continue
+    fi
+    [[ "$skipping" == "false" ]] && printf '%s\n' "$line" >> "$temp"
+  done < "$config"
+  backup_file "$config"
+  mv "$temp" "$config"
+}
+
+write_hyprland_manifest() {
+  local config="$1" temp
+  temp="$(mktemp "$CONFIG_DIR/.hyprland-install.XXXXXX")" || return 1
+  chmod 600 "$temp" || {
+    rm -f "$temp"
+    return 1
+  }
+  printf '%s\n' "$config" > "$temp" || {
+    rm -f "$temp"
+    return 1
+  }
+  mv "$temp" "$HYPRLAND_MANIFEST_PATH"
+}
+
+hyprland_config_errors() {
+  [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] || return 0
+  command -v hyprctl >/dev/null 2>&1 || return 0
+  hyprctl configerrors 2>/dev/null || true
+}
+
+reload_hyprland() {
+  local expected_errors="${1:-}" mode="${2:-strict}" errors
+  HYPRLAND_RELOAD_ERROR=""
+  [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] || return 0
+  command -v hyprctl >/dev/null 2>&1 || return 0
+  if ! hyprctl reload >/dev/null; then
+    HYPRLAND_RELOAD_ERROR="Hyprland could not reload its configuration."
+  else
+    errors="$(hyprland_config_errors)"
+    if hyprland_errors_added "$expected_errors" "$errors"; then
+      HYPRLAND_RELOAD_ERROR="Hyprland reported new configuration errors after reload: $errors"
+    fi
+  fi
+  [[ -z "$HYPRLAND_RELOAD_ERROR" ]] && return 0
+  if [[ "$mode" == "warn" ]]; then
+    printf 'Warning: %s\n' "$HYPRLAND_RELOAD_ERROR" >&2
+    return 0
+  fi
+  return 1
+}
+
+hyprland_errors_added() {
+  local previous="$1" current="$2" current_line previous_line found
+  while IFS= read -r current_line || [[ -n "$current_line" ]]; do
+    [[ -n "$current_line" ]] || continue
+    found=false
+    while IFS= read -r previous_line || [[ -n "$previous_line" ]]; do
+      if [[ "$current_line" == "$previous_line" ]]; then
+        found=true
+        break
+      fi
+    done <<< "$previous"
+    [[ "$found" == "true" ]] || return 0
+  done <<< "$current"
+  return 1
+}
+
 canonical_file() {
   [[ -f "$1" ]] || die "File not found: $1"
   realpath "$1"
@@ -1148,14 +1707,14 @@ reload_waybar() {
 }
 
 status_json() {
+  local text="$1"
   if [[ ! -f "$CONFIG_FILE" ]]; then
-    printf '%s\n' '{"text":"REC","alt":"failed","tooltip":"Replay buffer is not configured\\nRun gsr-replay setup","class":"failed"}'
+    printf '{"text":"%s","alt":"failed","tooltip":"Replay buffer is not configured\\nRun gsr-replay setup","class":"failed"}\n' "$(json_escape "$text")"
     return 0
   fi
   load_config
   validate_config
-  local state text tooltip class
-  text="REC"
+  local state tooltip class
   if ! output_filesystem_available; then
     state="failed"
     class="failed"

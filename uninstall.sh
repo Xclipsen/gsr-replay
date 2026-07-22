@@ -7,7 +7,7 @@ readonly CONFIG_DIR="$CONFIG_HOME/gsr-replay"
 readonly SERVICE_PATH="$CONFIG_HOME/systemd/user/gsr-replay.service"
 
 main() {
-  local purge=false
+  local purge=false cli_help=""
   if [[ "${1:-}" == "--purge" ]]; then
     purge=true
   elif [[ $# -gt 0 ]]; then
@@ -18,6 +18,16 @@ main() {
   if [[ -x "$BIN_DIR/gsr-replay" ]]; then
     if ! "$BIN_DIR/gsr-replay" waybar-uninstall; then
       printf 'Error: Waybar cleanup failed. The CLI and service were preserved so cleanup can be retried.\n' >&2
+      exit 1
+    fi
+    cli_help="$("$BIN_DIR/gsr-replay" help 2>/dev/null || true)"
+    if [[ "$cli_help" == *hotkeys-uninstall* ]]; then
+      if ! "$BIN_DIR/gsr-replay" hotkeys-uninstall; then
+        printf 'Error: Hyprland hotkey cleanup failed. The CLI and service were preserved so cleanup can be retried.\n' >&2
+        exit 1
+      fi
+    elif [[ -e "$CONFIG_DIR/hyprland.conf" || -e "$CONFIG_DIR/hyprland-install" ]]; then
+      printf 'Error: Hyprland hotkeys were installed by a newer CLI and could not be removed safely.\n' >&2
       exit 1
     fi
   fi

@@ -9,11 +9,12 @@ ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 CLI="$ROOT_DIR/bin/gsr-replay"
 CALLBACK="$ROOT_DIR/bin/gsr-replay-callback"
 INSTALLER="$ROOT_DIR/install.sh"
+UNINSTALLER="$ROOT_DIR/uninstall.sh"
 BASH_BIN="$(command -v bash)"
 ORIGINAL_PATH="${PATH:-/usr/bin:/bin}"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/gsr-replay-tests.XXXXXX")"
 
-readonly SCRIPT_DIR ROOT_DIR CLI CALLBACK INSTALLER BASH_BIN ORIGINAL_PATH TMP_ROOT
+readonly SCRIPT_DIR ROOT_DIR CLI CALLBACK INSTALLER UNINSTALLER BASH_BIN ORIGINAL_PATH TMP_ROOT
 
 CASE_DIR=
 FAKE_BIN=
@@ -105,6 +106,7 @@ EOF
   chmod +x "$FAKE_BIN/omarchy-restart-waybar" || fail "could not create fake Waybar restart helper"
   export HOME XDG_CONFIG_HOME PATH
   unset FAKE_GSR_LOG FAKE_NOTIFY_LOG FAKE_SYSTEMCTL_LOG FAKE_SYSTEMCTL_STATE FAKE_SYSTEMCTL_FRAGMENT FAKE_SYSTEMCTL_DROPINS
+  unset FAKE_HYPR_STATE FAKE_HYPR_ERRORS_BEFORE FAKE_HYPR_ERRORS_AFTER HYPRLAND_INSTANCE_SIGNATURE
 }
 
 make_fake_systemctl() {
@@ -179,6 +181,26 @@ EOF
   chmod +x "$FAKE_BIN/omarchy" || fail "could not create fake omarchy"
 }
 
+make_fake_hyprctl() {
+  cat > "$FAKE_BIN/hyprctl" <<'EOF'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  reload)
+    : > "${FAKE_HYPR_STATE:?}"
+    ;;
+  configerrors)
+    if [[ -e "${FAKE_HYPR_STATE:?}" ]]; then
+      printf '%s\n' "${FAKE_HYPR_ERRORS_AFTER:-}"
+    else
+      printf '%s\n' "${FAKE_HYPR_ERRORS_BEFORE:-}"
+    fi
+    ;;
+esac
+EOF
+  chmod +x "$FAKE_BIN/hyprctl" || fail "could not create fake hyprctl"
+}
+
 write_test_config() {
   local monitor="${1:-screen}"
   local seconds="${2:-120}"
@@ -207,6 +229,10 @@ write_test_config() {
     printf 'GSR_REPLAY_WAYBAR_STYLE=%s\n' ''
     printf 'GSR_REPLAY_WAYBAR_POSITION=%s\n' 'right'
     printf 'GSR_REPLAY_WAYBAR_ENABLED=%s\n' 'false'
+    printf 'GSR_REPLAY_HYPRLAND_CONFIG=%s\n' ''
+    printf 'GSR_REPLAY_HYPRLAND_TOGGLE_BIND=%s\n' 'SUPER ALT, R'
+    printf 'GSR_REPLAY_HYPRLAND_SAVE_BIND=%s\n' 'SUPER, C'
+    printf 'GSR_REPLAY_HYPRLAND_ENABLED=%s\n' 'false'
   } >"$config_dir/config"
 }
 
@@ -276,6 +302,7 @@ test_help_and_version() {
     assert_contains "$CAPTURE_OUTPUT" 'GSR Replay - instant replay management' "help heading is missing"
     assert_contains "$CAPTURE_OUTPUT" 'Usage: gsr-replay <command>' "help usage is missing"
     assert_contains "$CAPTURE_OUTPUT" 'waybar-install' "help omits Waybar commands"
+    assert_contains "$CAPTURE_OUTPUT" 'hotkeys-install' "help omits Hyprland hotkey commands"
   done
 
   for argument in version --version -v; do
@@ -592,7 +619,7 @@ test_callback_notifications() {
 
 test_waybar_json() {
   local monitor='DP-"1\test'
-  local expected
+  local expected expected_status
 
   make_fake_systemctl
   write_test_config "$monitor" 120 default_output true "$CASE_DIR/replays"
@@ -602,19 +629,20 @@ test_waybar_json() {
   run_capture "$BASH_BIN" "$CLI" waybar
   assert_eq 0 "$CAPTURE_STATUS" "active Waybar status failed: $CAPTURE_OUTPUT"
   assert_waybar_json "$CAPTURE_OUTPUT"
-  expected='{"text":"REC","alt":"active","tooltip":"Replay buffer is active\nDisplay: DP-\"1\\test\nBuffer: 2 minutes\nLeft-click: Save clip\nRight-click: Stop","class":"active"}'
+  expected='{"text":"●","alt":"active","tooltip":"Replay buffer is active\nDisplay: DP-\"1\\test\nBuffer: 2 minutes\nLeft-click: Save clip\nRight-click: Stop","class":"active"}'
   assert_eq "$expected" "$CAPTURE_OUTPUT" "active Waybar JSON is incorrect or improperly escaped"
 
   run_capture "$BASH_BIN" "$CLI" status-json
   assert_eq 0 "$CAPTURE_STATUS" "desktop-neutral JSON status failed: $CAPTURE_OUTPUT"
-  assert_eq "$expected" "$CAPTURE_OUTPUT" "status-json and the Waybar compatibility alias differ"
+  expected_status='{"text":"REC","alt":"active","tooltip":"Replay buffer is active\nDisplay: DP-\"1\\test\nBuffer: 2 minutes\nLeft-click: Save clip\nRight-click: Stop","class":"active"}'
+  assert_eq "$expected_status" "$CAPTURE_OUTPUT" "status-json changed its desktop-neutral text contract"
 
   FAKE_SYSTEMCTL_STATE=inactive
   export FAKE_SYSTEMCTL_STATE
   run_capture "$BASH_BIN" "$CLI" waybar
   assert_eq 0 "$CAPTURE_STATUS" "inactive Waybar status failed: $CAPTURE_OUTPUT"
   assert_waybar_json "$CAPTURE_OUTPUT"
-  expected='{"text":"REC","alt":"inactive","tooltip":"Replay buffer is off\nRight-click: Start","class":"inactive"}'
+  expected='{"text":"●","alt":"inactive","tooltip":"Replay buffer is off\nRight-click: Start","class":"inactive"}'
   assert_eq "$expected" "$CAPTURE_OUTPUT" "inactive Waybar JSON is incorrect"
 
   FAKE_SYSTEMCTL_STATE=failed
@@ -622,7 +650,7 @@ test_waybar_json() {
   run_capture "$BASH_BIN" "$CLI" waybar
   assert_eq 0 "$CAPTURE_STATUS" "failed Waybar status failed: $CAPTURE_OUTPUT"
   assert_waybar_json "$CAPTURE_OUTPUT"
-  expected='{"text":"REC","alt":"failed","tooltip":"Replay buffer failed\nRight-click: Start again","class":"failed"}'
+  expected='{"text":"●","alt":"failed","tooltip":"Replay buffer failed\nRight-click: Start again","class":"failed"}'
   assert_eq "$expected" "$CAPTURE_OUTPUT" "failed Waybar JSON is incorrect"
 }
 
@@ -854,6 +882,21 @@ EOF
   assert_files_equal "$style_snapshot" "$style" "uninstall truncated or rewrote malformed CSS"
   assert_file_contains "$style" '#sentinel { color: green; }' "malformed CSS lost trailing content"
 
+  cat > "$style" <<'EOF'
+#waybar { color: white; }
+/* gsr-replay:end */
+#sentinel { color: green; }
+/* gsr-replay:start */
+#trailing { color: blue; }
+EOF
+  cp "$style" "$style_snapshot"
+  run_capture "$BASH_BIN" "$CLI" waybar-install "$config" "$style" right
+  assert_eq 1 "$CAPTURE_STATUS" "install should reject reversed CSS markers"
+  assert_contains "$CAPTURE_OUTPUT" "Malformed gsr-replay CSS markers in $style; no changes were made." \
+    "install did not report reversed CSS markers"
+  assert_files_equal "$style_snapshot" "$style" "install truncated styles after reversed markers"
+  assert_file_contains "$style" '#trailing { color: blue; }' "reversed CSS markers lost trailing content"
+
   shopt -s nullglob
   style_backups=("$style".gsr-replay.bak.*)
   shopt -u nullglob
@@ -976,6 +1019,207 @@ EOF
   assert_file_contains "$target" '"clock"' "symlink target lost existing configuration"
 }
 
+test_waybar_tray_anchor_and_style_upgrade() {
+  local waybar_dir="$XDG_CONFIG_HOME/waybar"
+  local config="$waybar_dir/config.jsonc"
+  local style="$waybar_dir/style.css"
+  local config_snapshot="$CASE_DIR/waybar.before"
+  local content
+
+  make_fake_omarchy
+  mkdir -p "$waybar_dir" || fail "could not create Waybar directory"
+  cat > "$config" <<'EOF'
+{
+  "modules-left": [
+  ],
+  "modules-center": [
+  ],
+  "modules-right": [
+    "group/tray-expander"
+  ]
+}
+EOF
+  cp "$config" "$config_snapshot"
+  cat > "$style" <<'EOF'
+#waybar { color: white; }
+
+/* gsr-replay:start */
+#custom-gsr-replay {
+  margin: 0 6px;
+  font-weight: bold;
+}
+
+#custom-gsr-replay.active {
+  color: #e06c75;
+}
+
+#custom-gsr-replay.inactive {
+  opacity: 0.45;
+}
+
+#custom-gsr-replay.failed {
+  color: #e5c07b;
+}
+/* gsr-replay:end */
+EOF
+
+  run_capture "$BASH_BIN" "$CLI" waybar-install "$config" "$style" right
+  assert_eq 0 "$CAPTURE_STATUS" "Waybar tray-anchored install failed: $CAPTURE_OUTPUT"
+  content="$(<"$config")"
+  assert_contains "$content" $'"group/tray-expander"\n    // gsr-replay:module-start\n    ,\n    "custom/gsr-replay",' \
+    "replay indicator was not placed immediately after the tray expander"
+  assert_contains "$content" $'// gsr-replay:module-end\n  ]' \
+    "replay indicator did not remain inside the right module list"
+  assert_file_contains "$style" 'color: #808080;' "inactive replay indicator is not gray"
+  assert_file_contains "$style" 'font-size: 13px;' "replay indicator is not styled as a compact dot"
+  assert_not_contains "$(<"$style")" 'opacity: 0.45;' "old inactive Waybar style was not upgraded"
+  assert_not_contains "$(<"$style")" 'font-weight: bold;' "old REC label styling was not removed"
+
+  run_capture "$BASH_BIN" "$CLI" waybar-uninstall "$config" "$style"
+  assert_eq 0 "$CAPTURE_STATUS" "tray-anchored Waybar uninstall failed: $CAPTURE_OUTPUT"
+  assert_files_equal "$config_snapshot" "$config" "Waybar uninstall did not restore the original tray syntax"
+}
+
+test_hyprland_hotkey_install_and_uninstall() {
+  local hyprland_dir="$XDG_CONFIG_HOME/hypr"
+  local config="$hyprland_dir/hyprland.conf"
+  local fragment="$XDG_CONFIG_HOME/gsr-replay/hyprland.conf"
+  local manifest="$XDG_CONFIG_HOME/gsr-replay/hyprland-install"
+  local config_after fragment_after content
+  local -a config_backups
+
+  mkdir -p "$hyprland_dir" || fail "could not create Hyprland directory"
+  cat > "$config" <<'EOF'
+source = ~/.config/hypr/bindings.conf
+bindd = SUPER, C, Existing replay command, exec, old-replay-save
+EOF
+
+  run_capture "$BASH_BIN" "$CLI" hotkeys-install "$config" 'SUPER ALT, R' 'alt super, r'
+  assert_eq 1 "$CAPTURE_STATUS" "equivalent Hyprland bindings should be rejected"
+  assert_contains "$CAPTURE_OUTPUT" 'Hyprland toggle and save bindings must be different.' \
+    "equivalent hotkey rejection is unclear"
+  assert_not_contains "$(<"$config")" 'gsr-replay:hotkeys' "rejected equivalent hotkeys changed the Hyprland config"
+  [[ ! -e "$fragment" ]] || fail "hotkey fragment was created for equivalent bindings"
+
+  run_capture "$BASH_BIN" "$CLI" hotkeys-install "$config" 'SUPER ALT, R' 'SUPER, C'
+  assert_eq 0 "$CAPTURE_STATUS" "Hyprland hotkey install failed: $CAPTURE_OUTPUT"
+  assert_contains "$CAPTURE_OUTPUT" "Hyprland hotkeys installed in $config." "hotkey install reported the wrong config"
+  [[ -f "$fragment" ]] || fail "Hyprland hotkey fragment was not created"
+  [[ -f "$manifest" ]] || fail "Hyprland hotkey manifest was not created"
+  assert_file_contains "$config" '# gsr-replay:hotkeys-start' "Hyprland config is missing managed markers"
+  assert_file_contains "$config" "source = $fragment" "Hyprland config does not source the generated fragment"
+  assert_file_contains "$config" 'Existing replay command' "hotkey install removed an existing binding"
+  assert_file_contains "$fragment" 'unbind = SUPER ALT, R' "toggle hotkey does not override a previous binding safely"
+  assert_file_contains "$fragment" "bindd = SUPER ALT, R, Toggle replay buffer, exec, $CLI toggle" "toggle hotkey command is incorrect"
+  assert_file_contains "$fragment" 'unbind = SUPER, C' "save hotkey does not override a previous binding safely"
+  assert_file_contains "$fragment" "bindd = SUPER, C, Save replay clip, exec, $CLI save" "save hotkey command is incorrect"
+  assert_eq "$config" "$(<"$manifest")" "Hyprland manifest recorded the wrong config"
+
+  config_after="$(<"$config")"
+  fragment_after="$(<"$fragment")"
+  run_capture "$BASH_BIN" "$CLI" hotkeys-install "$config" 'SUPER ALT, R' 'SUPER, C'
+  assert_eq 0 "$CAPTURE_STATUS" "second Hyprland hotkey install failed: $CAPTURE_OUTPUT"
+  assert_eq "$config_after" "$(<"$config")" "idempotent hotkey install changed the Hyprland config"
+  assert_eq "$fragment_after" "$(<"$fragment")" "idempotent hotkey install changed the generated fragment"
+  shopt -s nullglob
+  config_backups=("$config".gsr-replay.bak.*)
+  shopt -u nullglob
+  assert_eq 1 "${#config_backups[@]}" "idempotent hotkey install created another config backup"
+
+  run_capture "$BASH_BIN" "$CLI" hotkeys-uninstall "$config"
+  assert_eq 0 "$CAPTURE_STATUS" "Hyprland hotkey uninstall failed: $CAPTURE_OUTPUT"
+  assert_eq 'Hyprland hotkeys removed.' "$CAPTURE_OUTPUT" "hotkey uninstall output is incorrect"
+  [[ ! -e "$fragment" ]] || fail "Hyprland hotkey fragment remains after uninstall"
+  [[ ! -e "$manifest" ]] || fail "Hyprland hotkey manifest remains after uninstall"
+  content="$(<"$config")"
+  assert_not_contains "$content" 'gsr-replay:hotkeys' "managed hotkey markers remain after uninstall"
+  assert_not_contains "$content" "$fragment" "generated hotkey source remains after uninstall"
+  assert_contains "$content" 'Existing replay command' "hotkey uninstall removed the previous binding"
+}
+
+test_hyprland_reload_rollback() {
+  local hyprland_dir="$XDG_CONFIG_HOME/hypr"
+  local config="$hyprland_dir/hyprland.conf"
+  local snapshot="$CASE_DIR/hyprland.before"
+  local fragment="$XDG_CONFIG_HOME/gsr-replay/hyprland.conf"
+  local manifest="$XDG_CONFIG_HOME/gsr-replay/hyprland-install"
+
+  mkdir -p "$hyprland_dir" || fail "could not create Hyprland directory"
+  printf 'bindd = SUPER, RETURN, Terminal, exec, terminal\n' > "$config"
+  cp "$config" "$snapshot"
+  make_fake_hyprctl
+  HYPRLAND_INSTANCE_SIGNATURE="test"
+  FAKE_HYPR_STATE="$CASE_DIR/hyprland-reloaded"
+  FAKE_HYPR_ERRORS_BEFORE=""
+  FAKE_HYPR_ERRORS_AFTER="invalid generated binding"
+  export HYPRLAND_INSTANCE_SIGNATURE FAKE_HYPR_STATE FAKE_HYPR_ERRORS_BEFORE FAKE_HYPR_ERRORS_AFTER
+
+  run_capture "$BASH_BIN" "$CLI" hotkeys-install "$config" 'SUPER ALT, R' 'SUPER, C'
+  assert_eq 1 "$CAPTURE_STATUS" "new Hyprland errors should fail hotkey installation"
+  assert_contains "$CAPTURE_OUTPUT" 'invalid generated binding' "hotkey reload failure omitted the Hyprland error"
+  assert_contains "$CAPTURE_OUTPUT" 'previous Hyprland configuration was restored' "hotkey reload failure omitted rollback confirmation"
+  assert_files_equal "$snapshot" "$config" "failed hotkey reload did not restore the Hyprland config"
+  [[ ! -e "$fragment" ]] || fail "failed hotkey reload left the generated fragment"
+  [[ ! -e "$manifest" ]] || fail "failed hotkey reload left the install manifest"
+
+  rm -f "$FAKE_HYPR_STATE"
+  FAKE_HYPR_ERRORS_BEFORE="existing unrelated error"
+  FAKE_HYPR_ERRORS_AFTER=""
+  export FAKE_HYPR_ERRORS_BEFORE FAKE_HYPR_ERRORS_AFTER
+  run_capture "$BASH_BIN" "$CLI" hotkeys-install "$config" 'SUPER ALT, R' 'SUPER, C'
+  assert_eq 0 "$CAPTURE_STATUS" "hotkey install should allow a reload that fixes an existing error: $CAPTURE_OUTPUT"
+  [[ -f "$fragment" && -f "$manifest" ]] || fail "successful repaired reload did not install hotkeys"
+}
+
+test_malformed_hyprland_markers_are_preserved() {
+  local hyprland_dir="$XDG_CONFIG_HOME/hypr"
+  local config="$hyprland_dir/hyprland.conf"
+  local snapshot="$CASE_DIR/hyprland.before"
+  local -a config_backups
+
+  mkdir -p "$hyprland_dir" || fail "could not create Hyprland directory"
+  cat > "$config" <<'EOF'
+bindd = SUPER, RETURN, Terminal, exec, terminal
+# gsr-replay:hotkeys-start
+source = /tmp/missing-gsr-replay-hotkeys.conf
+EOF
+  cp "$config" "$snapshot"
+
+  run_capture "$BASH_BIN" "$CLI" hotkeys-install "$config" 'SUPER ALT, R' 'SUPER, C'
+  assert_eq 1 "$CAPTURE_STATUS" "install should reject malformed Hyprland markers"
+  assert_contains "$CAPTURE_OUTPUT" "Malformed gsr-replay hotkey markers in $config; no changes were made." \
+    "hotkey install did not explain malformed markers"
+  assert_files_equal "$snapshot" "$config" "hotkey install modified malformed Hyprland config"
+  [[ ! -e "$XDG_CONFIG_HOME/gsr-replay/hyprland.conf" ]] || fail "hotkey fragment was created after preflight failure"
+
+  shopt -s nullglob
+  config_backups=("$config".gsr-replay.bak.*)
+  shopt -u nullglob
+  assert_eq 0 "${#config_backups[@]}" "malformed Hyprland config unexpectedly received a backup"
+}
+
+test_uninstall_accepts_older_cli() {
+  local installed_bin="$HOME/.local/bin"
+  local installed_cli="$installed_bin/gsr-replay"
+
+  mkdir -p "$installed_bin" || fail "could not create local bin directory"
+  cat > "$installed_cli" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  help) printf '%s\n' 'waybar-install waybar-uninstall' ;;
+  waybar-uninstall) printf '%s\n' 'Waybar integration removed.' ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod +x "$installed_cli"
+  make_fake_systemctl
+
+  run_capture "$BASH_BIN" "$UNINSTALLER"
+  assert_eq 0 "$CAPTURE_STATUS" "uninstaller rejected an older CLI without hotkey artifacts: $CAPTURE_OUTPUT"
+  assert_contains "$CAPTURE_OUTPUT" 'Removed gsr-replay.' "uninstaller did not complete for an older CLI"
+  [[ ! -e "$installed_cli" ]] || fail "uninstaller left the older CLI installed"
+}
+
 test_install_no_setup() {
   local systemctl_log="$CASE_DIR/systemctl.log"
   local installed_bin="$HOME/.local/bin"
@@ -1015,7 +1259,7 @@ run_test() {
 }
 
 printf 'TAP version 13\n'
-printf '1..24\n'
+printf '1..29\n'
 run_test 'help and version commands' test_help_and_version
 run_test 'recorder argument construction and audio omission' test_recorder_arguments
 run_test 'portal recording restores its portal session' test_portal_recorder_arguments
@@ -1039,6 +1283,11 @@ run_test 'Waybar reinstall moves its managed module between positions' test_wayb
 run_test 'malformed Waybar CSS markers fail without truncation' test_malformed_css_markers_are_preserved
 run_test 'Waybar install is idempotent and uninstall is clean' test_waybar_install_idempotency_and_uninstall
 run_test 'symlinked Waybar configs preserve and patch their target' test_symlinked_waybar_config
+run_test 'Waybar anchors after the tray expander and upgrades managed styles' test_waybar_tray_anchor_and_style_upgrade
+run_test 'Hyprland hotkey install is idempotent and uninstall preserves existing bindings' test_hyprland_hotkey_install_and_uninstall
+run_test 'Hyprland reload failures roll back while repaired errors are accepted' test_hyprland_reload_rollback
+run_test 'malformed Hyprland hotkey markers fail without modification' test_malformed_hyprland_markers_are_preserved
+run_test 'uninstaller accepts older CLIs without hotkey artifacts' test_uninstall_accepts_older_cli
 run_test 'install.sh --no-setup stays inside an isolated home' test_install_no_setup
 
 printf '# %d passed, %d failed\n' "$PASSED" "$FAILED"

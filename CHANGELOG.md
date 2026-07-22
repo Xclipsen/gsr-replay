@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here.
 
+## Unreleased
+
+- Show the Waybar replay state as a red or gray dot and place it after the tray expander when available.
+- Add setup-managed, configurable Hyprland hotkeys for toggling and saving replays.
+
 ## 1.1.0 - 2026-07-22
 
 - Distinguish the replay buffer from ordinary GPU Screen Recorder processes.

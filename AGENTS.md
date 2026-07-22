@@ -2,8 +2,9 @@
 
 ## Scope
 
-Keep this repository desktop-independent. Omarchy-specific menus and widgets
-belong in the Omarchy fork; this project exposes stable CLI and JSON contracts.
+Keep core replay commands desktop-independent. Optional desktop integrations
+must remain isolated and opt-in. Omarchy-specific menus and widgets belong in
+the Omarchy fork; this project exposes stable CLI and JSON contracts.
 
 ## Safety
 

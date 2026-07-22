@@ -1,6 +1,6 @@
 # GSR Replay
 
-A small, production-ready instant replay controller for [GPU Screen Recorder](https://git.dec05eba.com/gpu-screen-recorder/about/). It provides guided onboarding, a resilient systemd user service, desktop notifications, and optional Waybar integration.
+A small, production-ready instant replay controller for [GPU Screen Recorder](https://git.dec05eba.com/gpu-screen-recorder/about/). It provides guided onboarding, a resilient systemd user service, desktop notifications, and optional Waybar and Hyprland integration.
 
 Omarchy 4 can consume the `status-json` command for native Quickshell integration without enabling the optional Waybar support.
 
@@ -11,6 +11,7 @@ Omarchy 4 can consume the `status-json` command for native Quickshell integratio
 - systemd user service with optional desktop-session autostart
 - Safe clip saving through systemd process signaling
 - Optional Waybar indicator with click controls and automatic config backups
+- Optional configurable Hyprland hotkeys for toggling and saving replays
 - Desktop notifications when clips are saved or a stopped buffer is started by a save request
 - Built-in status and dependency diagnostics
 - Idempotent installer and clean uninstaller
@@ -22,6 +23,7 @@ Omarchy 4 can consume the `status-json` command for native Quickshell integratio
 - [GPU Screen Recorder](https://git.dec05eba.com/gpu-screen-recorder/about/)
 - `notify-send` for optional desktop notifications
 - Waybar for the optional status module
+- Hyprland for optional setup-managed hotkeys
 
 On Arch Linux, install the main dependencies with:
 
@@ -68,6 +70,7 @@ The wizard lets you select:
 - Replay output directory
 - Desktop notifications and automatic startup
 - Optional Waybar integration and module position
+- Optional Hyprland hotkeys for toggling the buffer and saving a clip
 
 All onboarding and CLI text is in English.
 
@@ -84,6 +87,8 @@ gsr-replay status-json        Show machine-readable service status
 gsr-replay doctor             Check the installation
 gsr-replay list-monitors      List capture displays
 gsr-replay list-audio         List audio sources
+gsr-replay hotkeys-install    Install Hyprland hotkeys
+gsr-replay hotkeys-uninstall  Remove Hyprland hotkeys
 ```
 
 If `save` is called while the recorder is stopped, the service starts and asks you to try again after the buffer has collected footage.
@@ -94,7 +99,7 @@ During onboarding, choose **Install the Waybar status module**. The installer:
 
 1. Creates `~/.config/gsr-replay/waybar.jsonc`.
 2. Adds it through Waybar's supported `include` option.
-3. Adds `custom/gsr-replay` to the selected left, center, or right module list. For safety, that list must use Waybar's usual multiline JSONC format.
+3. Adds `custom/gsr-replay` to the selected left, center, or right module list. On the right, it is placed directly after `group/tray-expander` when that module exists. For safety, the selected list must use Waybar's usual multiline JSONC format.
 4. Adds a small style block to the selected stylesheet.
 5. Creates timestamped backups before changing either Waybar file.
 
@@ -102,15 +107,31 @@ Indicator controls:
 
 - Left-click: save a replay clip
 - Right-click: start or stop the replay buffer
-- Red `REC`: active
-- Dimmed `REC`: inactive
-- Amber `REC`: service failed
+- Red dot: active
+- Gray dot: inactive
+- Amber dot: service failed
 
 Manual integration commands are also available:
 
 ```bash
 gsr-replay waybar-install ~/.config/waybar/config.jsonc ~/.config/waybar/style.css right
 gsr-replay waybar-uninstall
+```
+
+## Hyprland Hotkeys
+
+During onboarding, choose **Install configurable Hyprland hotkeys**. The default bindings are:
+
+- `SUPER ALT + R`: start or stop the replay buffer
+- `SUPER + C`: save a replay clip
+
+The wizard lets you replace both bindings. It creates `~/.config/gsr-replay/hyprland.conf` and adds one managed `source` block to your Hyprland config. Each generated binding includes a matching `unbind`, so the selected key reliably invokes GSR Replay. Removing the integration removes both the binding and its `unbind`, restoring any earlier binding from the rest of your Hyprland configuration.
+
+Manual integration commands are also available:
+
+```bash
+gsr-replay hotkeys-install ~/.config/hypr/hyprland.conf "SUPER ALT, R" "SUPER, C"
+gsr-replay hotkeys-uninstall
 ```
 
 ## Configuration
@@ -148,7 +169,7 @@ If the output directory is a symlink to an unmounted drive, the service exits wi
 ./uninstall.sh
 ```
 
-This removes the CLI, service, and Waybar integration while preserving configuration and replay videos. To also remove the configuration:
+This removes the CLI, service, Waybar integration, and Hyprland hotkeys while preserving configuration and replay videos. To also remove the configuration:
 
 ```bash
 ./uninstall.sh --purge
