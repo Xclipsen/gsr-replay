@@ -21,6 +21,7 @@ Omarchy 4 can consume the `status-json` command for native Quickshell integratio
 - Linux with systemd user services
 - Bash 4.3 or newer
 - [GPU Screen Recorder](https://git.dec05eba.com/gpu-screen-recorder/about/)
+- FFmpeg for clip audio finalization
 - `notify-send` for optional desktop notifications
 - Waybar for the optional status module
 - Hyprland for optional setup-managed hotkeys
@@ -74,6 +75,12 @@ The wizard lets you select:
 
 All onboarding and CLI text is in English.
 
+With the default desktop-audio selection, the recorder keeps desktop and
+microphone audio in separate tracks without restarting when the analog output
+changes. A companion service records output changes, and the save callback
+mixes microphone audio only into the sections recorded while headphones were
+active.
+
 ## Commands
 
 ```text
@@ -82,6 +89,7 @@ gsr-replay start              Start the replay buffer
 gsr-replay stop               Stop the replay buffer
 gsr-replay toggle             Start or stop the replay buffer
 gsr-replay save               Save the current buffer
+gsr-replay archive            Archive clips whose delay has elapsed
 gsr-replay status             Show service and capture settings
 gsr-replay status-json        Show machine-readable service status
 gsr-replay doctor             Check the installation
@@ -123,14 +131,14 @@ gsr-replay waybar-uninstall
 During onboarding, choose **Install configurable Hyprland hotkeys**. The default bindings are:
 
 - `SUPER ALT + R`: start or stop the replay buffer
-- `SUPER + C`: save a replay clip
+- `SUPER ALT + C`: save a replay clip
 
 The wizard lets you replace both bindings. It creates `~/.config/gsr-replay/hyprland.conf` and adds one managed `source` block to your Hyprland config. Each generated binding includes a matching `unbind`, so the selected key reliably invokes GSR Replay. Removing the integration removes both the binding and its `unbind`, restoring any earlier binding from the rest of your Hyprland configuration.
 
 Manual integration commands are also available:
 
 ```bash
-gsr-replay hotkeys-install ~/.config/hypr/hyprland.conf "SUPER ALT, R" "SUPER, C"
+gsr-replay hotkeys-install ~/.config/hypr/hyprland.conf "SUPER ALT, R" "SUPER ALT, C"
 gsr-replay hotkeys-uninstall
 ```
 
@@ -145,6 +153,10 @@ Configuration is stored in:
 The generated file is a private key/value data file and must not be sourced as shell code. Prefer `gsr-replay setup` over manual edits because the wizard validates every setting.
 
 Replay videos default to `~/Videos/replay`. The uninstaller never removes replay videos.
+The setup wizard can keep newly saved clips in that local staging directory and
+move them to a separate archive after a configurable delay. A persistent user
+timer retries every minute. If a required archive filesystem is unavailable,
+the clips remain in staging until the configured filesystem returns.
 When `GSR_REPLAY_REQUIRED_FS_UUID` is set by an integration, recording and
 saving fail closed unless that exact filesystem is mounted below the output
 directory. This prevents an unavailable external drive from redirecting clips
@@ -180,7 +192,7 @@ This removes the CLI, service, Waybar integration, and Hyprland hotkeys while pr
 ```bash
 shellcheck bin/* install.sh uninstall.sh tests/run.sh
 bash tests/run.sh
-systemd-analyze --user verify systemd/gsr-replay.service
+systemd-analyze --user verify systemd/*.service systemd/*.timer
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete development and packaging checks. Release changes are tracked in [CHANGELOG.md](CHANGELOG.md).

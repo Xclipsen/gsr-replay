@@ -5,6 +5,9 @@ readonly BIN_DIR="$HOME/.local/bin"
 readonly CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 readonly CONFIG_DIR="$CONFIG_HOME/gsr-replay"
 readonly SERVICE_PATH="$CONFIG_HOME/systemd/user/gsr-replay.service"
+readonly ARCHIVE_SERVICE_PATH="$CONFIG_HOME/systemd/user/gsr-replay-archive.service"
+readonly ARCHIVE_TIMER_PATH="$CONFIG_HOME/systemd/user/gsr-replay-archive.timer"
+readonly AUDIO_MONITOR_SERVICE_PATH="$CONFIG_HOME/systemd/user/gsr-replay-audio-monitor.service"
 
 main() {
   local purge=false cli_help=""
@@ -33,7 +36,8 @@ main() {
   fi
 
   systemctl --user disable --now gsr-replay.service >/dev/null 2>&1 || true
-  rm -f "$BIN_DIR/gsr-replay" "$BIN_DIR/gsr-replay-callback" "$SERVICE_PATH"
+  systemctl --user disable --now gsr-replay-archive.timer >/dev/null 2>&1 || true
+  rm -f "$BIN_DIR/gsr-replay" "$BIN_DIR/gsr-replay-callback" "$SERVICE_PATH" "$ARCHIVE_SERVICE_PATH" "$ARCHIVE_TIMER_PATH" "$AUDIO_MONITOR_SERVICE_PATH"
   systemctl --user daemon-reload >/dev/null 2>&1 || true
 
   if [[ "$purge" == "true" ]]; then

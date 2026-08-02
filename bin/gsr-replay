@@ -3,9 +3,12 @@ set -euo pipefail
 
 readonly VERSION="1.1.0"
 readonly SERVICE_NAME="gsr-replay.service"
+readonly ARCHIVE_TIMER_NAME="gsr-replay-archive.timer"
 readonly CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 readonly CONFIG_DIR="$CONFIG_HOME/gsr-replay"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
+readonly AUDIO_STATE_LOG="$CONFIG_DIR/audio-state.log"
+readonly SAVE_REQUEST_TIME_FILE="$CONFIG_DIR/save-request-time"
 CLI_PATH="$(realpath "${BASH_SOURCE[0]}")"
 readonly CLI_PATH
 if [[ "$CLI_PATH" == /usr/bin/* ]]; then
@@ -41,6 +44,8 @@ main() {
     status-json) status_json "REC" ;;
     waybar) status_json "●" ;;
     verify-output) verify_output "$@" ;;
+    archive) archive_due_replays ;;
+    audio-monitor) audio_state_monitor ;;
     waybar-install) waybar_install_command "$@" ;;
     waybar-uninstall) waybar_uninstall_command "$@" ;;
     hotkeys-install) hotkeys_install_command "$@" ;;
@@ -69,6 +74,7 @@ Commands:
   status              Show service and recording configuration
   doctor              Check dependencies and configuration
   config              Print the configuration file
+  archive             Move due replay clips to archive storage
   list-monitors       List capture displays
   list-audio          List audio sources
   status-json         Print machine-readable service status as JSON
@@ -95,6 +101,9 @@ set_defaults() {
   GSR_REPLAY_STORAGE="${GSR_REPLAY_STORAGE:-ram}"
   GSR_REPLAY_DIR="${GSR_REPLAY_DIR:-${GSR_REPLAY_DEFAULT_DIR:-$(default_output_dir)}}"
   GSR_REPLAY_REQUIRED_FS_UUID="${GSR_REPLAY_REQUIRED_FS_UUID:-${GSR_REPLAY_DEFAULT_FS_UUID:-}}"
+  GSR_REPLAY_ARCHIVE_DIR="${GSR_REPLAY_ARCHIVE_DIR:-}"
+  GSR_REPLAY_ARCHIVE_AFTER_SECONDS="${GSR_REPLAY_ARCHIVE_AFTER_SECONDS:-1800}"
+  GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID="${GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID:-}"
   GSR_REPLAY_NOTIFICATIONS="${GSR_REPLAY_NOTIFICATIONS:-true}"
   GSR_REPLAY_WAYBAR_CONFIG="${GSR_REPLAY_WAYBAR_CONFIG:-}"
   GSR_REPLAY_WAYBAR_STYLE="${GSR_REPLAY_WAYBAR_STYLE:-}"
@@ -102,7 +111,7 @@ set_defaults() {
   GSR_REPLAY_WAYBAR_ENABLED="${GSR_REPLAY_WAYBAR_ENABLED:-false}"
   GSR_REPLAY_HYPRLAND_CONFIG="${GSR_REPLAY_HYPRLAND_CONFIG:-}"
   GSR_REPLAY_HYPRLAND_TOGGLE_BIND="${GSR_REPLAY_HYPRLAND_TOGGLE_BIND:-SUPER ALT, R}"
-  GSR_REPLAY_HYPRLAND_SAVE_BIND="${GSR_REPLAY_HYPRLAND_SAVE_BIND:-SUPER, C}"
+  GSR_REPLAY_HYPRLAND_SAVE_BIND="${GSR_REPLAY_HYPRLAND_SAVE_BIND:-SUPER ALT, C}"
   GSR_REPLAY_HYPRLAND_ENABLED="${GSR_REPLAY_HYPRLAND_ENABLED:-false}"
 }
 
@@ -113,7 +122,7 @@ load_config() {
     while IFS='=' read -r key value || [[ -n "$key" ]]; do
       [[ -z "$key" || "$key" == \#* ]] && continue
       case "$key" in
-        GSR_REPLAY_MONITOR | GSR_REPLAY_RESOLUTION | GSR_REPLAY_FPS | GSR_REPLAY_SECONDS | GSR_REPLAY_AUDIO | GSR_REPLAY_BITRATE | GSR_REPLAY_CODEC | GSR_REPLAY_STORAGE | GSR_REPLAY_DIR | GSR_REPLAY_REQUIRED_FS_UUID | GSR_REPLAY_NOTIFICATIONS | GSR_REPLAY_WAYBAR_CONFIG | GSR_REPLAY_WAYBAR_STYLE | GSR_REPLAY_WAYBAR_POSITION | GSR_REPLAY_WAYBAR_ENABLED | GSR_REPLAY_HYPRLAND_CONFIG | GSR_REPLAY_HYPRLAND_TOGGLE_BIND | GSR_REPLAY_HYPRLAND_SAVE_BIND | GSR_REPLAY_HYPRLAND_ENABLED)
+        GSR_REPLAY_MONITOR | GSR_REPLAY_RESOLUTION | GSR_REPLAY_FPS | GSR_REPLAY_SECONDS | GSR_REPLAY_AUDIO | GSR_REPLAY_BITRATE | GSR_REPLAY_CODEC | GSR_REPLAY_STORAGE | GSR_REPLAY_DIR | GSR_REPLAY_REQUIRED_FS_UUID | GSR_REPLAY_ARCHIVE_DIR | GSR_REPLAY_ARCHIVE_AFTER_SECONDS | GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID | GSR_REPLAY_NOTIFICATIONS | GSR_REPLAY_WAYBAR_CONFIG | GSR_REPLAY_WAYBAR_STYLE | GSR_REPLAY_WAYBAR_POSITION | GSR_REPLAY_WAYBAR_ENABLED | GSR_REPLAY_HYPRLAND_CONFIG | GSR_REPLAY_HYPRLAND_TOGGLE_BIND | GSR_REPLAY_HYPRLAND_SAVE_BIND | GSR_REPLAY_HYPRLAND_ENABLED)
           printf -v "$key" '%s' "$value"
           ;;
         *) die "Unknown setting in $CONFIG_FILE: $key" ;;
@@ -121,6 +130,7 @@ load_config() {
     done < "$CONFIG_FILE"
   fi
   GSR_REPLAY_DIR="$(expand_home "$GSR_REPLAY_DIR")"
+  GSR_REPLAY_ARCHIVE_DIR="$(expand_home "$GSR_REPLAY_ARCHIVE_DIR")"
   apply_enforced_output
 }
 
@@ -160,12 +170,59 @@ expand_home() {
   fi
 }
 
+active_default_audio_mode() {
+  command -v pactl >/dev/null 2>&1 || return 1
+  local default_sink sink_list line sink_name=""
+  default_sink="$(pactl get-default-sink 2>/dev/null)" || return 1
+  sink_list="$(LC_ALL=C pactl list sinks 2>/dev/null)" || return 1
+
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*Name:[[:space:]]*(.+)$ ]]; then
+      sink_name="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ ^[[:space:]]*Active[[:space:]]Port:[[:space:]]*(.+)$ && "$sink_name" == "$default_sink" ]]; then
+      if [[ "${BASH_REMATCH[1]}" == "analog-output-headphones" ]]; then
+        printf 'desktop-with-microphone\n'
+      else
+        printf 'desktop-only\n'
+      fi
+      return 0
+    fi
+  done <<< "$sink_list"
+  return 1
+}
+
+audio_state_monitor() {
+  require_config
+  load_config
+  validate_config
+  require_command pactl
+  mkdir -p "$CONFIG_DIR"
+  local state previous="" event
+  if state="$(active_default_audio_mode)"; then
+    printf '%s|%s\n' "$(date +%s)" "$state" >>"$AUDIO_STATE_LOG"
+    previous="$state"
+  fi
+
+  while IFS= read -r event; do
+    case "$event" in
+      *" on sink #"* | *" on card #"* | *" on server"*) ;;
+      *) continue ;;
+    esac
+    if state="$(active_default_audio_mode)" && [[ "$state" != "$previous" ]]; then
+      printf '%s|%s\n' "$(date +%s)" "$state" >>"$AUDIO_STATE_LOG"
+      previous="$state"
+    fi
+  done < <(LC_ALL=C pactl subscribe)
+  return 1
+}
+
 validate_config() {
   validate_text "Capture display" "$GSR_REPLAY_MONITOR"
   [[ -n "$GSR_REPLAY_MONITOR" ]] || die "Capture display cannot be empty."
   [[ "$GSR_REPLAY_RESOLUTION" =~ ^[0-9]+x[0-9]+$ ]] || die "Resolution must look like 1920x1080."
   validate_integer "Frame rate" "$GSR_REPLAY_FPS" 1 240
   validate_integer "Replay duration" "$GSR_REPLAY_SECONDS" 2 86400
+  validate_integer "Archive delay" "$GSR_REPLAY_ARCHIVE_AFTER_SECONDS" 60 604800
   validate_integer "Video bitrate" "$GSR_REPLAY_BITRATE" 500 200000
   [[ "$GSR_REPLAY_CODEC" =~ ^(auto|h264|hevc|av1|vp8|vp9|hevc_hdr|av1_hdr|hevc_10bit|av1_10bit)$ ]] || die "Unsupported video codec: $GSR_REPLAY_CODEC"
   [[ "$GSR_REPLAY_STORAGE" == "ram" || "$GSR_REPLAY_STORAGE" == "disk" ]] || die "Replay storage must be ram or disk."
@@ -174,6 +231,10 @@ validate_config() {
   [[ "$GSR_REPLAY_HYPRLAND_ENABLED" == "true" || "$GSR_REPLAY_HYPRLAND_ENABLED" == "false" ]] || die "Hyprland hotkeys must be true or false."
   [[ -n "$GSR_REPLAY_DIR" ]] || die "Replay output directory cannot be empty."
   [[ "$GSR_REPLAY_DIR" == /* ]] || die "Replay output directory must be an absolute path."
+  [[ -z "$GSR_REPLAY_ARCHIVE_DIR" || "$GSR_REPLAY_ARCHIVE_DIR" == /* ]] || die "Replay archive directory must be an absolute path."
+  if [[ -n "$GSR_REPLAY_ARCHIVE_DIR" ]]; then
+    [[ "$(realpath -m "$GSR_REPLAY_DIR")" != "$(realpath -m "$GSR_REPLAY_ARCHIVE_DIR")" ]] || die "Replay output and archive directories must be different."
+  fi
   validate_text "Audio source" "$GSR_REPLAY_AUDIO"
   validate_text "Replay output directory" "$GSR_REPLAY_DIR"
   validate_text "Hyprland config path" "$GSR_REPLAY_HYPRLAND_CONFIG"
@@ -181,6 +242,7 @@ validate_config() {
   hyprland_binding_valid "$GSR_REPLAY_HYPRLAND_SAVE_BIND" || die "Invalid Hyprland save binding: $GSR_REPLAY_HYPRLAND_SAVE_BIND"
   [[ "$(normalize_hyprland_binding "$GSR_REPLAY_HYPRLAND_TOGGLE_BIND")" != "$(normalize_hyprland_binding "$GSR_REPLAY_HYPRLAND_SAVE_BIND")" ]] || die "Hyprland toggle and save bindings must be different."
   [[ -z "$GSR_REPLAY_REQUIRED_FS_UUID" || "$GSR_REPLAY_REQUIRED_FS_UUID" =~ ^[A-Fa-f0-9-]+$ ]] || die "Required filesystem UUID contains unsupported characters."
+  [[ -z "$GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID" || "$GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID" =~ ^[A-Fa-f0-9-]+$ ]] || die "Archive filesystem UUID contains unsupported characters."
   if [[ "$GSR_REPLAY_STORAGE" == "ram" ]] && (( $(estimated_buffer_mib) > MAX_RAM_BUFFER_MIB )); then
     die "The estimated RAM buffer exceeds ${MAX_RAM_BUFFER_MIB} MiB. Choose disk storage or lower the duration/bitrate."
   fi
@@ -208,15 +270,86 @@ prepare_output_dir() {
 }
 
 output_filesystem_available() {
-  local probe actual_uuid
-  [[ -n "$GSR_REPLAY_REQUIRED_FS_UUID" ]] || return 0
+  filesystem_available "$GSR_REPLAY_DIR" "$GSR_REPLAY_REQUIRED_FS_UUID"
+}
+
+filesystem_available() {
+  local probe="$1" required_uuid="$2" actual_uuid
+  [[ -n "$required_uuid" ]] || return 0
   command -v findmnt >/dev/null 2>&1 || return 1
-  probe="$GSR_REPLAY_DIR"
   while [[ ! -e "$probe" && "$probe" != "/" ]]; do
     probe="$(dirname -- "$probe")"
   done
   actual_uuid="$(findmnt -n -o UUID --target "$probe" 2>/dev/null || true)"
-  [[ "$actual_uuid" == "$GSR_REPLAY_REQUIRED_FS_UUID" ]]
+  [[ "$actual_uuid" == "$required_uuid" ]]
+}
+
+filesystem_uuid_for_path() {
+  local probe="$1"
+  command -v findmnt >/dev/null 2>&1 || return 0
+  while [[ ! -e "$probe" && "$probe" != "/" ]]; do
+    probe="$(dirname -- "$probe")"
+  done
+  findmnt -n -o UUID --target "$probe" 2>/dev/null || true
+}
+
+archive_due_replays() {
+  require_config
+  load_config
+  validate_config
+  [[ -n "$GSR_REPLAY_ARCHIVE_DIR" ]] || return 0
+  require_command flock
+  mkdir -p "$CONFIG_DIR"
+  exec 9>"$CONFIG_DIR/archive.lock"
+  flock -n 9 || return 0
+
+  if ! filesystem_available "$GSR_REPLAY_ARCHIVE_DIR" "$GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID"; then
+    printf 'Replay archive filesystem is unavailable; clips remain in %s.\n' "$GSR_REPLAY_DIR" >&2
+    return 0
+  fi
+  mkdir -p "$GSR_REPLAY_ARCHIVE_DIR"
+  [[ -d "$GSR_REPLAY_ARCHIVE_DIR" && -w "$GSR_REPLAY_ARCHIVE_DIR" ]] || die "Replay archive is not writable: $GSR_REPLAY_ARCHIVE_DIR"
+
+  local now modified file
+  local -a files=("$GSR_REPLAY_DIR"/*.mp4)
+  now="$(date +%s)"
+  for file in "${files[@]}"; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    modified="$(stat -c %Y -- "$file" 2>/dev/null || true)"
+    [[ "$modified" =~ ^[0-9]+$ ]] || continue
+    ((now - modified >= GSR_REPLAY_ARCHIVE_AFTER_SECONDS)) || continue
+    archive_replay_file "$file"
+  done
+}
+
+archive_replay_file() {
+  local source="$1" name destination stem extension candidate temp index=1
+  name="$(basename -- "$source")"
+  destination="$GSR_REPLAY_ARCHIVE_DIR/$name"
+  if [[ -f "$destination" && ! -L "$destination" ]] && cmp -s -- "$source" "$destination"; then
+    rm -f -- "$source"
+    return 0
+  fi
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    stem="${name%.*}"
+    extension=".${name##*.}"
+    while true; do
+      candidate="$GSR_REPLAY_ARCHIVE_DIR/$stem ($index)$extension"
+      if [[ ! -e "$candidate" && ! -L "$candidate" ]]; then
+        destination="$candidate"
+        break
+      fi
+      ((index += 1))
+    done
+  fi
+
+  temp="$(mktemp "$GSR_REPLAY_ARCHIVE_DIR/.gsr-replay.XXXXXX.part")"
+  if ! cp -p -- "$source" "$temp" || ! cmp -s -- "$source" "$temp"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+  mv -- "$temp" "$destination"
+  rm -f -- "$source"
 }
 
 verify_output() {
@@ -256,7 +389,9 @@ run_recorder() {
   if [[ "$GSR_REPLAY_MONITOR" == "portal" ]]; then
     args+=( -restore-portal-session yes )
   fi
-  if [[ "$GSR_REPLAY_AUDIO" != "none" ]]; then
+  if [[ "$GSR_REPLAY_AUDIO" == "default_output" ]]; then
+    args+=( -a default_output -a default_input )
+  elif [[ "$GSR_REPLAY_AUDIO" != "none" ]]; then
     args+=( -a "$GSR_REPLAY_AUDIO" )
   fi
 
@@ -264,10 +399,89 @@ run_recorder() {
 }
 
 replay_saved() {
-  local file="${1:-}"
+  local file="${1:-}" type="${2:-replay}"
   load_config
   [[ -n "$file" && -f "$file" ]] || return 0
+  if [[ "$type" == "replay" && "$GSR_REPLAY_AUDIO" == "default_output" ]]; then
+    finalize_replay_audio "$file"
+  fi
   notify "Replay clip saved" "$file" normal 7000
+}
+
+finalize_replay_audio() {
+  local file="$1" temp duration rounded_duration fraction end_time start_time microphone_intervals filter
+  require_command ffmpeg
+  require_command ffprobe
+  duration="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$file")"
+  [[ "$duration" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+  rounded_duration="${duration%%.*}"
+  fraction="${duration#*.}"
+  if [[ "$duration" != "$rounded_duration" && ! "$fraction" =~ ^0+$ ]]; then
+    ((rounded_duration += 1))
+  fi
+  end_time="$(replay_save_request_time)"
+  start_time="$((end_time - rounded_duration))"
+  microphone_intervals="$(microphone_enable_expression "$start_time" "$end_time" "$duration")"
+  temp="$(mktemp "$(dirname -- "$file")/.gsr-replay-audio.XXXXXX.mp4")"
+
+  if [[ -n "$microphone_intervals" ]]; then
+    filter="[0:a:1]volume='if(gt(${microphone_intervals},0),1,0)':eval=frame[mic];[0:a:0][mic]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.95[a]"
+    if ! ffmpeg -hide_banner -loglevel error -y -i "$file" \
+      -filter_complex "$filter" \
+      -map 0:v:0 -map '[a]' -map_metadata 0 -c:v copy -c:a aac -b:a 192k -movflags +faststart "$temp"; then
+      rm -f -- "$temp"
+      return 1
+    fi
+  elif ! ffmpeg -hide_banner -loglevel error -y -i "$file" \
+    -map 0:v:0 -map 0:a:0 -map_metadata 0 -c copy -movflags +faststart "$temp"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+  mv -- "$temp" "$file"
+  rm -f -- "$SAVE_REQUEST_TIME_FILE"
+}
+
+replay_save_request_time() {
+  local timestamp=""
+  if [[ -f "$SAVE_REQUEST_TIME_FILE" ]]; then
+    timestamp="$(<"$SAVE_REQUEST_TIME_FILE")"
+  fi
+  if [[ "$timestamp" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$timestamp"
+  else
+    date +%s
+  fi
+}
+
+microphone_enable_expression() {
+  local clip_start="$1" clip_end="$2" duration="$3"
+  local timestamp state mode="desktop-only" interval_start="" expression="" relative_start relative_end
+  [[ -f "$AUDIO_STATE_LOG" ]] || return 0
+
+  while IFS='|' read -r timestamp state; do
+    [[ "$timestamp" =~ ^[0-9]+$ ]] || continue
+    [[ "$state" == "desktop-only" || "$state" == "desktop-with-microphone" ]] || continue
+    if ((timestamp <= clip_start)); then
+      mode="$state"
+      continue
+    fi
+    ((timestamp < clip_end)) || break
+    if [[ "$mode" == "desktop-with-microphone" && "$state" == "desktop-only" ]]; then
+      relative_start="${interval_start:-0}"
+      relative_end="$((timestamp - clip_start))"
+      expression+="${expression:+ + }between(t,$relative_start,$relative_end)"
+      interval_start=""
+    elif [[ "$mode" == "desktop-only" && "$state" == "desktop-with-microphone" ]]; then
+      interval_start="$((timestamp - clip_start))"
+    fi
+    mode="$state"
+  done <"$AUDIO_STATE_LOG"
+
+  if [[ "$mode" == "desktop-with-microphone" ]]; then
+    relative_start="${interval_start:-0}"
+    expression+="${expression:+ + }between(t,$relative_start,$duration)"
+  fi
+  printf '%s' "$expression"
 }
 
 save_replay() {
@@ -284,7 +498,11 @@ save_replay() {
     die "Replay buffer was not running. It has been started; try again in a moment."
   fi
 
-  notify "Saving replay clip" "Saving the last $(format_duration "$GSR_REPLAY_SECONDS")." normal 2500
+  mkdir -p "$CONFIG_DIR"
+  local save_time_temp
+  save_time_temp="$(mktemp "$CONFIG_DIR/.save-request-time.XXXXXX")"
+  date +%s >"$save_time_temp"
+  mv "$save_time_temp" "$SAVE_REQUEST_TIME_FILE"
   systemctl --user kill --kill-whom=main --signal=SIGUSR1 "$SERVICE_NAME"
   printf 'Replay save requested.\n'
 }
@@ -368,6 +586,9 @@ status() {
   printf 'Duration:      %s\n' "$(format_duration "$GSR_REPLAY_SECONDS")"
   printf 'Audio:         %s\n' "$GSR_REPLAY_AUDIO"
   printf 'Output:        %s\n' "$GSR_REPLAY_DIR"
+  if [[ -n "$GSR_REPLAY_ARCHIVE_DIR" ]]; then
+    printf 'Archive:       %s after %s\n' "$GSR_REPLAY_ARCHIVE_DIR" "$(format_duration "$GSR_REPLAY_ARCHIVE_AFTER_SECONDS")"
+  fi
   printf 'Storage:       %s\n' "$GSR_REPLAY_STORAGE"
 }
 
@@ -385,6 +606,7 @@ doctor() {
 
   check_command gpu-screen-recorder true || ((errors += 1))
   check_command systemctl true || ((errors += 1))
+  check_command ffmpeg true || ((errors += 1))
   check_command notify-send false || true
   check_command waybar false || true
 
@@ -528,6 +750,7 @@ setup() {
   ask_text GSR_REPLAY_DIR "Replay output directory" "$GSR_REPLAY_DIR" validate_nonempty
   GSR_REPLAY_DIR="$(expand_home "$GSR_REPLAY_DIR")"
   apply_enforced_output
+  configure_archive
   ask_yes_no GSR_REPLAY_NOTIFICATIONS "Show desktop notifications?" "$GSR_REPLAY_NOTIFICATIONS"
 
   local autostart start_now waybar_enabled hotkeys_enabled
@@ -582,6 +805,11 @@ setup() {
   prepare_output_dir
   write_config
   systemctl --user daemon-reload
+  if [[ -n "$GSR_REPLAY_ARCHIVE_DIR" ]]; then
+    systemctl --user enable --now "$ARCHIVE_TIMER_NAME"
+  else
+    systemctl --user disable --now "$ARCHIVE_TIMER_NAME" >/dev/null 2>&1 || true
+  fi
 
   if [[ "$autostart" == "true" ]]; then
     systemctl --user enable "$SERVICE_NAME"
@@ -627,6 +855,9 @@ setup() {
   printf '  Display:  %s\n' "$GSR_REPLAY_MONITOR"
   printf '  Replay:   %s at %s FPS, last %s\n' "$GSR_REPLAY_RESOLUTION" "$GSR_REPLAY_FPS" "$(format_duration "$GSR_REPLAY_SECONDS")"
   printf '  Output:   %s\n' "$GSR_REPLAY_DIR"
+  if [[ -n "$GSR_REPLAY_ARCHIVE_DIR" ]]; then
+    printf '  Archive:  %s after %s\n' "$GSR_REPLAY_ARCHIVE_DIR" "$(format_duration "$GSR_REPLAY_ARCHIVE_AFTER_SECONDS")"
+  fi
   if [[ "$hotkeys_enabled" == "true" ]]; then
     printf '  Toggle:   %s\n' "$GSR_REPLAY_HYPRLAND_TOGGLE_BIND"
     printf '  Save:     %s\n' "$GSR_REPLAY_HYPRLAND_SAVE_BIND"
@@ -723,6 +954,32 @@ choose_storage() {
     selected="disk"
   fi
   GSR_REPLAY_STORAGE="$selected"
+}
+
+configure_archive() {
+  local enabled=false delay_minutes detected_uuid
+  local previous_archive_dir="$GSR_REPLAY_ARCHIVE_DIR"
+  [[ -n "$GSR_REPLAY_ARCHIVE_DIR" ]] && enabled=true
+  ask_yes_no enabled "Move saved clips to archive storage after a delay?" "$enabled"
+  if [[ "$enabled" == "false" ]]; then
+    GSR_REPLAY_ARCHIVE_DIR=""
+    GSR_REPLAY_ARCHIVE_AFTER_SECONDS=1800
+    GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID=""
+    return
+  fi
+
+  [[ -n "$GSR_REPLAY_ARCHIVE_DIR" ]] || GSR_REPLAY_ARCHIVE_DIR="$HOME/Videos/replay-archive"
+  ask_text GSR_REPLAY_ARCHIVE_DIR "Replay archive directory" "$GSR_REPLAY_ARCHIVE_DIR" validate_nonempty
+  GSR_REPLAY_ARCHIVE_DIR="$(expand_home "$GSR_REPLAY_ARCHIVE_DIR")"
+  delay_minutes="$((GSR_REPLAY_ARCHIVE_AFTER_SECONDS / 60))"
+  ask_integer delay_minutes "Archive delay in minutes" "$delay_minutes" 1 10080
+  GSR_REPLAY_ARCHIVE_AFTER_SECONDS="$((delay_minutes * 60))"
+  detected_uuid="$(filesystem_uuid_for_path "$GSR_REPLAY_ARCHIVE_DIR")"
+  if [[ -n "$detected_uuid" ]]; then
+    GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID="$detected_uuid"
+  elif [[ "$GSR_REPLAY_ARCHIVE_DIR" != "$previous_archive_dir" ]]; then
+    GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID=""
+  fi
 }
 
 select_option() {
@@ -864,6 +1121,9 @@ write_config() {
     write_setting GSR_REPLAY_STORAGE "$GSR_REPLAY_STORAGE"
     write_setting GSR_REPLAY_DIR "$GSR_REPLAY_DIR"
     write_setting GSR_REPLAY_REQUIRED_FS_UUID "$GSR_REPLAY_REQUIRED_FS_UUID"
+    write_setting GSR_REPLAY_ARCHIVE_DIR "$GSR_REPLAY_ARCHIVE_DIR"
+    write_setting GSR_REPLAY_ARCHIVE_AFTER_SECONDS "$GSR_REPLAY_ARCHIVE_AFTER_SECONDS"
+    write_setting GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID "$GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID"
     write_setting GSR_REPLAY_NOTIFICATIONS "$GSR_REPLAY_NOTIFICATIONS"
     write_setting GSR_REPLAY_WAYBAR_CONFIG "$GSR_REPLAY_WAYBAR_CONFIG"
     write_setting GSR_REPLAY_WAYBAR_STYLE "$GSR_REPLAY_WAYBAR_STYLE"

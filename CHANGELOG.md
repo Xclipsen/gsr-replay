@@ -6,6 +6,10 @@ All notable changes to this project are documented here.
 
 - Show the Waybar replay state as a red or gray dot and place it after the tray expander when available.
 - Add setup-managed, configurable Hyprland hotkeys for toggling and saving replays.
+- Capture desktop and microphone audio separately and mix the microphone only during headphone-active replay sections.
+- Track audio output changes with an event-driven systemd companion service.
+- Add optional delayed clip archiving from local staging to UUID-validated external storage.
+- Add archive destination and delay configuration to the setup wizard.
 
 ## 1.1.0 - 2026-07-22
 

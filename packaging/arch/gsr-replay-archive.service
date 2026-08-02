@@ -1,0 +1,8 @@
+[Unit]
+Description=Archive due GSR Replay clips
+Documentation=https://github.com/Xclipsen/gsr-replay
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/gsr-replay archive
+UMask=0077

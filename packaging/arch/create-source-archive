@@ -8,9 +8,11 @@ archive="$root/packaging/arch/gsr-replay-$version.tar.gz"
 files=(
   AGENTS.md CHANGELOG.md CONTRIBUTING.md LICENSE README.md SECURITY.md
   bin/gsr-replay bin/gsr-replay-callback install.sh uninstall.sh
-  systemd/gsr-replay.service tests/run.sh
+  systemd/gsr-replay.service systemd/gsr-replay-archive.service
+  systemd/gsr-replay-archive.timer systemd/gsr-replay-audio-monitor.service tests/run.sh
   packaging/arch/create-source-archive packaging/arch/gsr-replay.install
-  packaging/arch/gsr-replay.service
+  packaging/arch/gsr-replay.service packaging/arch/gsr-replay-archive.service
+  packaging/arch/gsr-replay-archive.timer packaging/arch/gsr-replay-audio-monitor.service
 )
 
 temp=$(mktemp "$archive.XXXXXX")

@@ -20,8 +20,8 @@ jobs:
         run: shellcheck bin/* install.sh uninstall.sh tests/run.sh
       - name: Run tests
         run: bash tests/run.sh
-      - name: Verify systemd service
-        run: install -Dm755 bin/gsr-replay "$HOME/.local/bin/gsr-replay" && systemd-analyze --user verify systemd/gsr-replay.service
+      - name: Verify systemd services
+        run: install -Dm755 bin/gsr-replay "$HOME/.local/bin/gsr-replay" && systemd-analyze --user verify systemd/*.service systemd/*.timer
 
   package:
     runs-on: ubuntu-latest

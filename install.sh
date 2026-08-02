@@ -7,6 +7,9 @@ readonly BIN_DIR="$HOME/.local/bin"
 readonly CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 readonly SERVICE_DIR="$CONFIG_HOME/systemd/user"
 readonly SERVICE_PATH="$SERVICE_DIR/gsr-replay.service"
+readonly ARCHIVE_SERVICE_PATH="$SERVICE_DIR/gsr-replay-archive.service"
+readonly ARCHIVE_TIMER_PATH="$SERVICE_DIR/gsr-replay-archive.timer"
+readonly AUDIO_MONITOR_SERVICE_PATH="$SERVICE_DIR/gsr-replay-audio-monitor.service"
 
 main() {
   local run_setup=true
@@ -24,10 +27,16 @@ main() {
   backup_if_different "$ROOT_DIR/bin/gsr-replay" "$BIN_DIR/gsr-replay"
   backup_if_different "$ROOT_DIR/bin/gsr-replay-callback" "$BIN_DIR/gsr-replay-callback"
   backup_if_different "$ROOT_DIR/systemd/gsr-replay.service" "$SERVICE_PATH"
+  backup_if_different "$ROOT_DIR/systemd/gsr-replay-archive.service" "$ARCHIVE_SERVICE_PATH"
+  backup_if_different "$ROOT_DIR/systemd/gsr-replay-archive.timer" "$ARCHIVE_TIMER_PATH"
+  backup_if_different "$ROOT_DIR/systemd/gsr-replay-audio-monitor.service" "$AUDIO_MONITOR_SERVICE_PATH"
 
   install -m 0755 "$ROOT_DIR/bin/gsr-replay" "$BIN_DIR/gsr-replay"
   install -m 0755 "$ROOT_DIR/bin/gsr-replay-callback" "$BIN_DIR/gsr-replay-callback"
   install -m 0644 "$ROOT_DIR/systemd/gsr-replay.service" "$SERVICE_PATH"
+  install -m 0644 "$ROOT_DIR/systemd/gsr-replay-archive.service" "$ARCHIVE_SERVICE_PATH"
+  install -m 0644 "$ROOT_DIR/systemd/gsr-replay-archive.timer" "$ARCHIVE_TIMER_PATH"
+  install -m 0644 "$ROOT_DIR/systemd/gsr-replay-audio-monitor.service" "$AUDIO_MONITOR_SERVICE_PATH"
   systemctl --user daemon-reload
 
   printf 'Installed gsr-replay in %s.\n' "$BIN_DIR"

@@ -2,7 +2,8 @@
 Description=GPU Screen Recorder replay buffer
 Documentation=https://github.com/Xclipsen/gsr-replay
 PartOf=graphical-session.target
-After=graphical-session.target
+Wants=gsr-replay-audio-monitor.service
+After=graphical-session.target gsr-replay-audio-monitor.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 

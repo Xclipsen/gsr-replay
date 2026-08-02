@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically archive GSR Replay clips
+Documentation=https://github.com/Xclipsen/gsr-replay
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+Persistent=true
+Unit=gsr-replay-archive.service
+
+[Install]
+WantedBy=timers.target

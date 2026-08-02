@@ -1,0 +1,11 @@
+[Unit]
+Description=Track audio output changes for GSR Replay
+Documentation=https://github.com/Xclipsen/gsr-replay
+PartOf=gsr-replay.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/gsr-replay audio-monitor
+Restart=on-failure
+RestartSec=5
+UMask=0077

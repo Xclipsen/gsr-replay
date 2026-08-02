@@ -104,8 +104,10 @@ EOF
 exit 0
 EOF
   chmod +x "$FAKE_BIN/omarchy-restart-waybar" || fail "could not create fake Waybar restart helper"
+  make_fake_pactl
   export HOME XDG_CONFIG_HOME PATH
   unset FAKE_GSR_LOG FAKE_NOTIFY_LOG FAKE_SYSTEMCTL_LOG FAKE_SYSTEMCTL_STATE FAKE_SYSTEMCTL_FRAGMENT FAKE_SYSTEMCTL_DROPINS
+  unset FAKE_PACTL_DEFAULT_SINK FAKE_PACTL_PORT FAKE_FFMPEG_LOG
   unset FAKE_HYPR_STATE FAKE_HYPR_ERRORS_BEFORE FAKE_HYPR_ERRORS_AFTER HYPRLAND_INSTANCE_SIGNATURE
 }
 
@@ -165,6 +167,51 @@ EOF
   chmod +x "$FAKE_BIN/gpu-screen-recorder" || fail "could not create fake recorder"
 }
 
+make_fake_pactl() {
+  cat >"$FAKE_BIN/pactl" <<'EOF'
+#!/usr/bin/env bash
+set -u
+case "$*" in
+  get-default-sink)
+    printf '%s\n' "${FAKE_PACTL_DEFAULT_SINK:-alsa_output.test}"
+    ;;
+  "list sinks")
+    printf 'Sink #1\n\tName: %s\n\tActive Port: %s\n' \
+      "${FAKE_PACTL_DEFAULT_SINK:-alsa_output.test}" \
+      "${FAKE_PACTL_PORT:-analog-output-lineout}"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+EOF
+  chmod +x "$FAKE_BIN/pactl" || fail "could not create fake pactl"
+}
+
+make_fake_ffmpeg() {
+  cat >"$FAKE_BIN/ffmpeg" <<'EOF'
+#!/usr/bin/env bash
+set -u
+printf '<%s>\n' "$@" >"${FAKE_FFMPEG_LOG:?}"
+input=""
+previous=""
+for argument in "$@"; do
+  if [[ "$previous" == "-i" ]]; then
+    input="$argument"
+  fi
+  previous="$argument"
+done
+output="${!#}"
+cp -- "$input" "$output"
+EOF
+  chmod +x "$FAKE_BIN/ffmpeg" || fail "could not create fake ffmpeg"
+  cat >"$FAKE_BIN/ffprobe" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "${FAKE_FFPROBE_DURATION:-120.0}"
+EOF
+  chmod +x "$FAKE_BIN/ffprobe" || fail "could not create fake ffprobe"
+}
+
 install_expected_service() {
   local service_path="$XDG_CONFIG_HOME/systemd/user/gsr-replay.service"
   mkdir -p "$(dirname -- "$service_path")"
@@ -210,6 +257,9 @@ write_test_config() {
   local storage="${6:-disk}"
   local bitrate="${7:-12345}"
   local required_uuid="${8:-}"
+  local archive_dir="${9:-}"
+  local archive_after="${10:-1800}"
+  local archive_uuid="${11:-}"
   local config_dir="$XDG_CONFIG_HOME/gsr-replay"
 
   mkdir -p "$config_dir" || fail "could not create configuration directory"
@@ -224,6 +274,9 @@ write_test_config() {
     printf 'GSR_REPLAY_STORAGE=%s\n' "$storage"
     printf 'GSR_REPLAY_DIR=%s\n' "$output_dir"
     printf 'GSR_REPLAY_REQUIRED_FS_UUID=%s\n' "$required_uuid"
+    printf 'GSR_REPLAY_ARCHIVE_DIR=%s\n' "$archive_dir"
+    printf 'GSR_REPLAY_ARCHIVE_AFTER_SECONDS=%s\n' "$archive_after"
+    printf 'GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID=%s\n' "$archive_uuid"
     printf 'GSR_REPLAY_NOTIFICATIONS=%s\n' "$notifications"
     printf 'GSR_REPLAY_WAYBAR_CONFIG=%s\n' ''
     printf 'GSR_REPLAY_WAYBAR_STYLE=%s\n' ''
@@ -368,6 +421,27 @@ test_recorder_arguments() {
   assert_eq "$expected" "$actual" "recorder should omit -a when audio is disabled"
 }
 
+test_recorder_captures_separate_audio_tracks() {
+  local recorder_log="$CASE_DIR/recorder-arguments"
+  local output_dir="$CASE_DIR/replays"
+  local callback_path="$HOME/.local/bin/gsr-replay-callback"
+  local actual
+
+  FAKE_GSR_LOG="$recorder_log"
+  export FAKE_GSR_LOG
+  make_fake_recorder
+  mkdir -p "$(dirname -- "$callback_path")" || fail "could not create callback directory"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$callback_path"
+  chmod +x "$callback_path"
+  write_test_config screen 75 default_output true "$output_dir"
+
+  run_capture "$BASH_BIN" "$CLI" run
+  assert_eq 0 "$CAPTURE_STATUS" "recorder command with separate audio tracks failed: $CAPTURE_OUTPUT"
+  actual="$(<"$recorder_log")"
+  assert_contains "$actual" $'<-a>\n<default_output>\n<-a>\n<default_input>' \
+    "recorder should always capture desktop and microphone as separate tracks"
+}
+
 test_portal_recorder_arguments() {
   local recorder_log="$CASE_DIR/recorder-arguments"
   local output_dir="$CASE_DIR/portal-replays"
@@ -400,7 +474,8 @@ test_portal_recorder_arguments() {
     -sc "$callback_path" \
     -o "$output_dir" \
     -restore-portal-session yes \
-    -a default_output)"
+    -a default_output \
+    -a default_input)"
   assert_eq "$expected" "$actual" "portal recorder arguments do not restore the portal session"
 }
 
@@ -518,7 +593,6 @@ test_missing_config_blocks_start_paths() {
 test_save_active() {
   local systemctl_log="$CASE_DIR/systemctl.log"
   local notify_log="$CASE_DIR/notify.log"
-  local expected_notify
 
   : >"$systemctl_log"
   : >"$notify_log"
@@ -536,13 +610,7 @@ test_save_active() {
   assert_eq 'Replay save requested.' "$CAPTURE_OUTPUT" "active save confirmation is incorrect"
   assert_eq $'--user show gsr-replay.service --property=FragmentPath --value\n--user show gsr-replay.service --property=DropInPaths --value\n--user is-active --quiet gsr-replay.service\n--user kill --kill-whom=main --signal=SIGUSR1 gsr-replay.service' \
     "$(<"$systemctl_log")" "active save sent incorrect systemctl commands"
-  expected_notify="$(printf '<%s>\n' \
-    '--app-name=GSR Replay' \
-    '--urgency=normal' \
-    '--expire-time=2500' \
-    'Saving replay clip' \
-    'Saving the last 2 minutes.')"
-  assert_eq "$expected_notify" "$(<"$notify_log")" "active save notification is incorrect"
+  assert_eq '' "$(<"$notify_log")" "active save should wait for the completion notification"
 }
 
 test_save_inactive() {
@@ -581,7 +649,7 @@ test_callback_notifications() {
   local installed_dir="$HOME/.local/bin"
   local replay_file="$CASE_DIR/a replay clip.mp4"
   local second_file="$CASE_DIR/notifications-disabled.mp4"
-  local expected_notify first_log
+  local expected_notify first_log ffmpeg_log="$CASE_DIR/ffmpeg.log"
 
   : >"$notify_log"
   : >"$replay_file"
@@ -589,6 +657,9 @@ test_callback_notifications() {
   FAKE_NOTIFY_LOG="$notify_log"
   export FAKE_NOTIFY_LOG
   make_fake_notify_send
+  FAKE_FFMPEG_LOG="$ffmpeg_log"
+  export FAKE_FFMPEG_LOG
+  make_fake_ffmpeg
   mkdir -p "$installed_dir" || fail "could not create callback installation directory"
   cp "$CLI" "$installed_dir/gsr-replay"
   cp "$CALLBACK" "$installed_dir/gsr-replay-callback"
@@ -606,15 +677,59 @@ test_callback_notifications() {
     "$replay_file")"
   first_log="$(<"$notify_log")"
   assert_eq "$expected_notify" "$first_log" "callback save notification is incorrect"
+  assert_contains "$(<"$ffmpeg_log")" $'<-map>\n<0:a:0>' "line out should keep only desktop audio"
+  assert_not_contains "$(<"$ffmpeg_log")" 'amix=' "line out unexpectedly mixed microphone audio"
 
   run_capture "$installed_dir/gsr-replay-callback" "$CASE_DIR/missing.mp4"
   assert_eq 0 "$CAPTURE_STATUS" "callback should ignore a missing replay file"
   assert_eq "$first_log" "$(<"$notify_log")" "callback notified for a missing replay file"
 
   write_test_config screen 120 default_output false "$CASE_DIR/replays"
+  printf '%s\n' \
+    '800|desktop-only' \
+    '900|desktop-with-microphone' \
+    '930|desktop-only' \
+    '950|desktop-with-microphone' \
+    '990|desktop-only' >"$XDG_CONFIG_HOME/gsr-replay/audio-state.log"
+  printf '1000\n' >"$XDG_CONFIG_HOME/gsr-replay/save-request-time"
   run_capture "$installed_dir/gsr-replay-callback" "$second_file"
   assert_eq 0 "$CAPTURE_STATUS" "callback failed when notifications were disabled"
   assert_eq "$first_log" "$(<"$notify_log")" "callback ignored the notifications setting"
+  assert_contains "$(<"$ffmpeg_log")" 'between(t,20,50) + between(t,70,110)' \
+    "callback did not limit microphone audio to headphone intervals"
+}
+
+test_delayed_replay_archiving() {
+  local staging="$CASE_DIR/staging"
+  local archive="$CASE_DIR/archive"
+  local old_clip="$staging/old clip.mp4"
+  local fresh_clip="$staging/fresh clip.mp4"
+  local unavailable_clip="$staging/waits for disk.mp4"
+
+  mkdir -p "$staging" "$archive"
+  printf 'new version\n' >"$old_clip"
+  printf 'fresh\n' >"$fresh_clip"
+  printf 'existing version\n' >"$archive/old clip.mp4"
+  touch -d '31 minutes ago' "$old_clip"
+  write_test_config screen 120 none false "$staging" disk 12345 '' "$archive" 1800
+
+  run_capture "$BASH_BIN" "$CLI" archive
+  assert_eq 0 "$CAPTURE_STATUS" "archiving due replay clips failed: $CAPTURE_OUTPUT"
+  [[ ! -e "$old_clip" ]] || fail "due replay clip remained in staging"
+  assert_eq 'existing version' "$(<"$archive/old clip.mp4")" "archive collision overwrote an existing clip"
+  assert_eq 'new version' "$(<"$archive/old clip (1).mp4")" "archive collision did not preserve the due clip"
+  [[ -e "$fresh_clip" ]] || fail "fresh replay clip was archived before its delay elapsed"
+
+  printf 'waiting\n' >"$unavailable_clip"
+  touch -d '31 minutes ago' "$unavailable_clip"
+  make_fake_findmnt
+  FAKE_FINDMNT_UUID=FFFF-0000
+  export FAKE_FINDMNT_UUID
+  write_test_config screen 120 none false "$staging" disk 12345 '' "$archive" 1800 A1B2-C3D4
+  run_capture "$BASH_BIN" "$CLI" archive
+  assert_eq 0 "$CAPTURE_STATUS" "unavailable archive filesystem should be retried later"
+  [[ -e "$unavailable_clip" ]] || fail "clip was deleted while archive filesystem was unavailable"
+  [[ ! -e "$archive/waits for disk.mp4" ]] || fail "clip was archived to the wrong filesystem"
 }
 
 test_waybar_json() {
@@ -1224,6 +1339,9 @@ test_install_no_setup() {
   local systemctl_log="$CASE_DIR/systemctl.log"
   local installed_bin="$HOME/.local/bin"
   local installed_service="$XDG_CONFIG_HOME/systemd/user/gsr-replay.service"
+  local installed_archive_service="$XDG_CONFIG_HOME/systemd/user/gsr-replay-archive.service"
+  local installed_archive_timer="$XDG_CONFIG_HOME/systemd/user/gsr-replay-archive.timer"
+  local installed_audio_monitor="$XDG_CONFIG_HOME/systemd/user/gsr-replay-audio-monitor.service"
 
   : >"$systemctl_log"
   FAKE_SYSTEMCTL_LOG="$systemctl_log"
@@ -1239,9 +1357,15 @@ test_install_no_setup() {
   [[ -x "$installed_bin/gsr-replay" ]] || fail "installer did not install the CLI as executable"
   [[ -x "$installed_bin/gsr-replay-callback" ]] || fail "installer did not install the callback as executable"
   [[ -f "$installed_service" ]] || fail "installer did not install the user service under XDG_CONFIG_HOME"
+  [[ -f "$installed_archive_service" ]] || fail "installer did not install the archive service"
+  [[ -f "$installed_archive_timer" ]] || fail "installer did not install the archive timer"
+  [[ -f "$installed_audio_monitor" ]] || fail "installer did not install the audio monitor service"
   assert_files_equal "$CLI" "$installed_bin/gsr-replay" "installed CLI differs from the source"
   assert_files_equal "$CALLBACK" "$installed_bin/gsr-replay-callback" "installed callback differs from the source"
   assert_files_equal "$ROOT_DIR/systemd/gsr-replay.service" "$installed_service" "installed service differs from the source"
+  assert_files_equal "$ROOT_DIR/systemd/gsr-replay-archive.service" "$installed_archive_service" "installed archive service differs from the source"
+  assert_files_equal "$ROOT_DIR/systemd/gsr-replay-archive.timer" "$installed_archive_timer" "installed archive timer differs from the source"
+  assert_files_equal "$ROOT_DIR/systemd/gsr-replay-audio-monitor.service" "$installed_audio_monitor" "installed audio monitor differs from the source"
   assert_eq '--user daemon-reload' "$(<"$systemctl_log")" "installer sent incorrect systemctl commands"
   [[ ! -e "$XDG_CONFIG_HOME/gsr-replay/config" ]] || fail "--no-setup unexpectedly created a replay config"
 }
@@ -1259,9 +1383,10 @@ run_test() {
 }
 
 printf 'TAP version 13\n'
-printf '1..29\n'
+printf '1..31\n'
 run_test 'help and version commands' test_help_and_version
 run_test 'recorder argument construction and audio omission' test_recorder_arguments
+run_test 'recorder captures separate desktop and microphone tracks' test_recorder_captures_separate_audio_tracks
 run_test 'portal recording restores its portal session' test_portal_recorder_arguments
 run_test 'config values are parsed as data without shell evaluation' test_config_values_are_data
 run_test 'unsafe oversized RAM buffers are rejected' test_oversized_ram_config
@@ -1271,6 +1396,7 @@ run_test 'missing configuration blocks every start path' test_missing_config_blo
 run_test 'saving an active replay signals the recorder' test_save_active
 run_test 'saving an inactive replay starts the service' test_save_inactive
 run_test 'callback notifications respect file and config state' test_callback_notifications
+run_test 'due replay clips move safely to archive storage' test_delayed_replay_archiving
 run_test 'Waybar emits valid active, inactive, and failed JSON' test_waybar_json
 run_test 'service control rejects a shadowing user unit' test_service_fragment_mismatch
 run_test 'service control rejects execution-changing drop-ins' test_service_dropin_mismatch
