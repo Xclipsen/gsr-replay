@@ -11,7 +11,7 @@ Run all local checks before opening a pull request:
 ```bash
 shellcheck bin/* install.sh uninstall.sh tests/run.sh
 bash tests/run.sh
-systemd-analyze --user verify systemd/gsr-replay.service
+systemd-analyze --user verify systemd/*.service systemd/*.timer
 ```
 
 For packaging changes, also run:

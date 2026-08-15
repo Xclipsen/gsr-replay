@@ -8,6 +8,7 @@ Omarchy 4 can consume the `status-json` command for native Quickshell integratio
 
 - Interactive setup with automatic display and audio-source discovery
 - Configurable resolution, frame rate, duration, bitrate, output directory, and RAM or disk buffering
+- Optional delayed archiving from local staging to UUID-pinned external storage
 - systemd user service with optional desktop-session autostart
 - Safe clip saving through systemd process signaling
 - Optional Waybar indicator with click controls and automatic config backups
@@ -29,7 +30,7 @@ Omarchy 4 can consume the `status-json` command for native Quickshell integratio
 On Arch Linux, install the main dependencies with:
 
 ```bash
-sudo pacman -S gpu-screen-recorder libnotify
+sudo pacman -S ffmpeg gpu-screen-recorder libnotify
 ```
 
 ## Install
@@ -69,6 +70,7 @@ The wizard lets you select:
 - Desktop audio, microphone, another audio device, or no audio
 - RAM or disk replay-buffer storage
 - Replay output directory
+- Optional archive directory and delay
 - Desktop notifications and automatic startup
 - Optional Waybar integration and module position
 - Optional Hyprland hotkeys for toggling the buffer and saving a clip
@@ -155,8 +157,24 @@ The generated file is a private key/value data file and must not be sourced as s
 Replay videos default to `~/Videos/replay`. The uninstaller never removes replay videos.
 The setup wizard can keep newly saved clips in that local staging directory and
 move them to a separate archive after a configurable delay. A persistent user
-timer retries every minute. If a required archive filesystem is unavailable,
-the clips remain in staging until the configured filesystem returns.
+timer retries every minute. The archive directory must already exist on its
+mounted filesystem during setup; its filesystem UUID is then pinned. If that
+filesystem is unavailable later, the job refuses to create the archive path on
+the system disk and leaves the clips in staging until the configured filesystem
+returns.
+Archive runs are serialized with save callbacks. Each clip is copied to a
+temporary file, compared with the staging copy, flushed to storage, and only
+then published and removed from staging. A per-clip transaction marker records
+the chosen collision-safe destination. Interrupted copies are cleaned up on the
+next run, while a destination that was already published by that transaction is
+reused without confusing a separate, legitimately identical clip for a retry.
+A restart does not lose the queue: due `.mp4` files still present in staging are
+discovered by the timer.
+If audio finalization is interrupted, its recovery marker and original clip stay
+in staging. The archive job retries finalization before moving that clip, even
+if the current audio configuration has since changed. Recovery markers are tied
+to the exact staged file, and delayed callbacks cannot consume the timestamp of
+a newer save. Only one save request can be pending at a time.
 When `GSR_REPLAY_REQUIRED_FS_UUID` is set by an integration, recording and
 saving fail closed unless that exact filesystem is mounted below the output
 directory. This prevents an unavailable external drive from redirecting clips
@@ -174,6 +192,13 @@ journalctl --user -u gsr-replay.service -n 100 --no-pager
 If a configured monitor is disconnected, rerun `gsr-replay setup` and select an available display or the desktop portal.
 
 If the output directory is a symlink to an unmounted drive, the service exits without creating a directory in the symlink's place. Mount the drive and start the service again.
+
+On NVIDIA systems, every recorder start performs a short in-memory H.264 probe.
+If an FFmpeg update requires a newer NVENC API than the installed driver provides,
+GSR Replay automatically tries the H.264 Vulkan GPU encoder and only falls back
+to CPU encoding if Vulkan is also unavailable. The selected fallback is written
+to the user-service journal. If none of those encoders is usable, the service
+stops with a permanent error instead of entering a restart loop.
 
 ## Uninstall
 

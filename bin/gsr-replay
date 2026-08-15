@@ -3,20 +3,34 @@ set -euo pipefail
 
 readonly VERSION="1.1.0"
 readonly SERVICE_NAME="gsr-replay.service"
+readonly ARCHIVE_SERVICE_NAME="gsr-replay-archive.service"
 readonly ARCHIVE_TIMER_NAME="gsr-replay-archive.timer"
+readonly AUDIO_MONITOR_SERVICE_NAME="gsr-replay-audio-monitor.service"
 readonly CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 readonly CONFIG_DIR="$CONFIG_HOME/gsr-replay"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
 readonly AUDIO_STATE_LOG="$CONFIG_DIR/audio-state.log"
 readonly SAVE_REQUEST_TIME_FILE="$CONFIG_DIR/save-request-time"
+readonly SAVE_REQUEST_LOCK_FILE="$CONFIG_DIR/save-request.lock"
+readonly MEDIA_LOCK_FILE="$CONFIG_DIR/archive.lock"
+readonly AUDIO_PENDING_SUFFIX=".gsr-replay-audio-pending"
+readonly ARCHIVE_PENDING_SUFFIX=".gsr-replay-archive-pending"
+readonly SAVE_REQUEST_TIMEOUT_SECONDS=600
+readonly SAVE_REQUEST_MATCH_WINDOW_SECONDS=120
 CLI_PATH="$(realpath "${BASH_SOURCE[0]}")"
 readonly CLI_PATH
 if [[ "$CLI_PATH" == /usr/bin/* ]]; then
   readonly SERVICE_PATH="/usr/lib/systemd/user/$SERVICE_NAME"
+  readonly ARCHIVE_SERVICE_PATH="/usr/lib/systemd/user/$ARCHIVE_SERVICE_NAME"
+  readonly ARCHIVE_TIMER_PATH="/usr/lib/systemd/user/$ARCHIVE_TIMER_NAME"
+  readonly AUDIO_MONITOR_SERVICE_PATH="/usr/lib/systemd/user/$AUDIO_MONITOR_SERVICE_NAME"
   readonly CALLBACK_PATH="/usr/lib/gsr-replay/gsr-replay-callback"
   readonly REINSTALL_HINT="Reinstall the gsr-replay package."
 else
   readonly SERVICE_PATH="$CONFIG_HOME/systemd/user/$SERVICE_NAME"
+  readonly ARCHIVE_SERVICE_PATH="$CONFIG_HOME/systemd/user/$ARCHIVE_SERVICE_NAME"
+  readonly ARCHIVE_TIMER_PATH="$CONFIG_HOME/systemd/user/$ARCHIVE_TIMER_NAME"
+  readonly AUDIO_MONITOR_SERVICE_PATH="$CONFIG_HOME/systemd/user/$AUDIO_MONITOR_SERVICE_NAME"
   readonly CALLBACK_PATH="$HOME/.local/bin/gsr-replay-callback"
   readonly REINSTALL_HINT="Re-run install.sh."
 fi
@@ -26,6 +40,8 @@ readonly HYPRLAND_FRAGMENT_PATH="$CONFIG_DIR/hyprland.conf"
 readonly HYPRLAND_MANIFEST_PATH="$CONFIG_DIR/hyprland-install"
 readonly MAX_RAM_BUFFER_MIB=8192
 HYPRLAND_RELOAD_ERROR=""
+RUNTIME_VIDEO_CODEC=""
+RUNTIME_VIDEO_ENCODER="gpu"
 
 main() {
   local command="${1:-help}"
@@ -180,7 +196,7 @@ active_default_audio_mode() {
     if [[ "$line" =~ ^[[:space:]]*Name:[[:space:]]*(.+)$ ]]; then
       sink_name="${BASH_REMATCH[1]}"
     elif [[ "$line" =~ ^[[:space:]]*Active[[:space:]]Port:[[:space:]]*(.+)$ && "$sink_name" == "$default_sink" ]]; then
-      if [[ "${BASH_REMATCH[1]}" == "analog-output-headphones" ]]; then
+      if [[ "${BASH_REMATCH[1],,}" == *headphone* || "${BASH_REMATCH[1],,}" == *headset* ]]; then
         printf 'desktop-with-microphone\n'
       else
         printf 'desktop-only\n'
@@ -195,11 +211,14 @@ audio_state_monitor() {
   require_config
   load_config
   validate_config
+  [[ "$GSR_REPLAY_AUDIO" == "default_output" ]] || return 0
   require_command pactl
+  require_command sync
   mkdir -p "$CONFIG_DIR"
+  ensure_regular_state_file "$AUDIO_STATE_LOG" "Audio state log"
   local state previous="" event
   if state="$(active_default_audio_mode)"; then
-    printf '%s|%s\n' "$(date +%s)" "$state" >>"$AUDIO_STATE_LOG"
+    append_audio_state "$state" || return 1
     previous="$state"
   fi
 
@@ -209,11 +228,16 @@ audio_state_monitor() {
       *) continue ;;
     esac
     if state="$(active_default_audio_mode)" && [[ "$state" != "$previous" ]]; then
-      printf '%s|%s\n' "$(date +%s)" "$state" >>"$AUDIO_STATE_LOG"
+      append_audio_state "$state" || return 1
       previous="$state"
     fi
   done < <(LC_ALL=C pactl subscribe)
   return 1
+}
+
+append_audio_state() {
+  printf '%s|%s\n' "$(date +%s)" "$1" >>"$AUDIO_STATE_LOG" || return 1
+  sync -- "$AUDIO_STATE_LOG"
 }
 
 validate_config() {
@@ -229,15 +253,17 @@ validate_config() {
   [[ "$GSR_REPLAY_NOTIFICATIONS" == "true" || "$GSR_REPLAY_NOTIFICATIONS" == "false" ]] || die "Notifications must be true or false."
   [[ "$GSR_REPLAY_WAYBAR_ENABLED" == "true" || "$GSR_REPLAY_WAYBAR_ENABLED" == "false" ]] || die "Waybar integration must be true or false."
   [[ "$GSR_REPLAY_HYPRLAND_ENABLED" == "true" || "$GSR_REPLAY_HYPRLAND_ENABLED" == "false" ]] || die "Hyprland hotkeys must be true or false."
+  validate_text "Audio source" "$GSR_REPLAY_AUDIO"
+  validate_text "Replay output directory" "$GSR_REPLAY_DIR"
+  validate_text "Replay archive directory" "$GSR_REPLAY_ARCHIVE_DIR"
+  validate_text "Hyprland config path" "$GSR_REPLAY_HYPRLAND_CONFIG"
   [[ -n "$GSR_REPLAY_DIR" ]] || die "Replay output directory cannot be empty."
   [[ "$GSR_REPLAY_DIR" == /* ]] || die "Replay output directory must be an absolute path."
   [[ -z "$GSR_REPLAY_ARCHIVE_DIR" || "$GSR_REPLAY_ARCHIVE_DIR" == /* ]] || die "Replay archive directory must be an absolute path."
   if [[ -n "$GSR_REPLAY_ARCHIVE_DIR" ]]; then
     [[ "$(realpath -m "$GSR_REPLAY_DIR")" != "$(realpath -m "$GSR_REPLAY_ARCHIVE_DIR")" ]] || die "Replay output and archive directories must be different."
+    [[ -n "$GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID" ]] || die "Replay archive storage must have a required filesystem UUID. Run setup again while the archive filesystem is mounted."
   fi
-  validate_text "Audio source" "$GSR_REPLAY_AUDIO"
-  validate_text "Replay output directory" "$GSR_REPLAY_DIR"
-  validate_text "Hyprland config path" "$GSR_REPLAY_HYPRLAND_CONFIG"
   hyprland_binding_valid "$GSR_REPLAY_HYPRLAND_TOGGLE_BIND" || die "Invalid Hyprland toggle binding: $GSR_REPLAY_HYPRLAND_TOGGLE_BIND"
   hyprland_binding_valid "$GSR_REPLAY_HYPRLAND_SAVE_BIND" || die "Invalid Hyprland save binding: $GSR_REPLAY_HYPRLAND_SAVE_BIND"
   [[ "$(normalize_hyprland_binding "$GSR_REPLAY_HYPRLAND_TOGGLE_BIND")" != "$(normalize_hyprland_binding "$GSR_REPLAY_HYPRLAND_SAVE_BIND")" ]] || die "Hyprland toggle and save bindings must be different."
@@ -281,15 +307,13 @@ filesystem_available() {
     probe="$(dirname -- "$probe")"
   done
   actual_uuid="$(findmnt -n -o UUID --target "$probe" 2>/dev/null || true)"
-  [[ "$actual_uuid" == "$required_uuid" ]]
+  [[ "${actual_uuid,,}" == "${required_uuid,,}" ]]
 }
 
 filesystem_uuid_for_path() {
   local probe="$1"
   command -v findmnt >/dev/null 2>&1 || return 0
-  while [[ ! -e "$probe" && "$probe" != "/" ]]; do
-    probe="$(dirname -- "$probe")"
-  done
+  [[ -d "$probe" ]] || return 0
   findmnt -n -o UUID --target "$probe" 2>/dev/null || true
 }
 
@@ -299,57 +323,263 @@ archive_due_replays() {
   validate_config
   [[ -n "$GSR_REPLAY_ARCHIVE_DIR" ]] || return 0
   require_command flock
+  require_command cmp
+  require_command ffprobe
+  require_command sync
   mkdir -p "$CONFIG_DIR"
-  exec 9>"$CONFIG_DIR/archive.lock"
+  ensure_safe_lock_file "$MEDIA_LOCK_FILE"
+  exec 9>>"$MEDIA_LOCK_FILE"
   flock -n 9 || return 0
 
+  if ! output_filesystem_available; then
+    printf 'Replay staging filesystem is unavailable; no clips were archived from %s.\n' "$GSR_REPLAY_DIR" >&2
+    return 0
+  fi
   if ! filesystem_available "$GSR_REPLAY_ARCHIVE_DIR" "$GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID"; then
     printf 'Replay archive filesystem is unavailable; clips remain in %s.\n' "$GSR_REPLAY_DIR" >&2
     return 0
   fi
   mkdir -p "$GSR_REPLAY_ARCHIVE_DIR"
   [[ -d "$GSR_REPLAY_ARCHIVE_DIR" && -w "$GSR_REPLAY_ARCHIVE_DIR" ]] || die "Replay archive is not writable: $GSR_REPLAY_ARCHIVE_DIR"
+  if ! filesystem_available "$GSR_REPLAY_ARCHIVE_DIR" "$GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID"; then
+    printf 'Replay archive filesystem changed while preparing it; clips remain in %s.\n' "$GSR_REPLAY_DIR" >&2
+    return 0
+  fi
+  cleanup_stale_media_temps
+  ARCHIVE_ACTIVE_TEMP=""
+  trap cleanup_active_archive_temp EXIT
+  trap 'exit 1' HUP INT TERM
 
-  local now modified file
+  local now modified file failures=0 archive_after
   local -a files=("$GSR_REPLAY_DIR"/*.mp4)
   now="$(date +%s)"
+  archive_after="$((10#$GSR_REPLAY_ARCHIVE_AFTER_SECONDS))"
   for file in "${files[@]}"; do
     [[ -f "$file" && ! -L "$file" ]] || continue
     modified="$(stat -c %Y -- "$file" 2>/dev/null || true)"
     [[ "$modified" =~ ^[0-9]+$ ]] || continue
-    ((now - modified >= GSR_REPLAY_ARCHIVE_AFTER_SECONDS)) || continue
-    archive_replay_file "$file"
+    ((now - modified >= archive_after)) || continue
+    if ! prepare_replay_for_archive "$file" || ! archive_replay_file "$file"; then
+      printf 'Could not finish archiving %s; no unverified staging copy was removed.\n' "$file" >&2
+      ((failures += 1))
+    fi
   done
+  ((failures == 0))
 }
 
 archive_replay_file() {
-  local source="$1" name destination stem extension candidate temp index=1
-  name="$(basename -- "$source")"
-  destination="$GSR_REPLAY_ARCHIVE_DIR/$name"
-  if [[ -f "$destination" && ! -L "$destination" ]] && cmp -s -- "$source" "$destination"; then
-    rm -f -- "$source"
-    return 0
-  fi
-  if [[ -e "$destination" || -L "$destination" ]]; then
-    stem="${name%.*}"
-    extension=".${name##*.}"
-    while true; do
-      candidate="$GSR_REPLAY_ARCHIVE_DIR/$stem ($index)$extension"
-      if [[ ! -e "$candidate" && ! -L "$candidate" ]]; then
-        destination="$candidate"
-        break
+  local source="$1" signature temp pending
+  ARCHIVE_DESTINATION=""
+  [[ -f "$source" && ! -L "$source" ]] || return 1
+  filesystem_available "$source" "$GSR_REPLAY_REQUIRED_FS_UUID" || return 1
+  signature="$(file_signature "$source")" || return 1
+  pending="$(archive_pending_path "$source")"
+
+  if [[ -f "$pending" && ! -L "$pending" ]]; then
+    if ! read_archive_pending "$pending" "$signature" "$source"; then
+      if ! rm -f -- "$pending" || ! sync -- "$(dirname -- "$pending")"; then
+        return 1
       fi
-      ((index += 1))
-    done
+    fi
+  elif [[ -e "$pending" || -L "$pending" ]]; then
+    return 1
+  fi
+  if [[ -z "${ARCHIVE_DESTINATION:-}" ]]; then
+    select_archive_destination "$source"
+    write_archive_pending "$pending" "$signature" "$(basename -- "$ARCHIVE_DESTINATION")" || return 1
   fi
 
-  temp="$(mktemp "$GSR_REPLAY_ARCHIVE_DIR/.gsr-replay.XXXXXX.part")"
-  if ! cp -p -- "$source" "$temp" || ! cmp -s -- "$source" "$temp"; then
+  temp="$(mktemp "$GSR_REPLAY_ARCHIVE_DIR/.gsr-replay.XXXXXX.part")" || return 1
+  ARCHIVE_ACTIVE_TEMP="$temp"
+  if ! filesystem_available "$temp" "$GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID" ||
+     ! cp -p -- "$source" "$temp" ||
+     [[ "$(file_signature "$source" 2>/dev/null || true)" != "$signature" ]] ||
+     ! cmp -s -- "$source" "$temp" ||
+     ! sync -- "$temp" ||
+     ! filesystem_available "$temp" "$GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID"; then
+    cleanup_active_archive_temp
+    return 1
+  fi
+
+  while true; do
+    if [[ -f "$ARCHIVE_DESTINATION" && ! -L "$ARCHIVE_DESTINATION" ]] && cmp -s -- "$source" "$ARCHIVE_DESTINATION"; then
+      cleanup_active_archive_temp
+      remove_archived_source "$source" "$ARCHIVE_DESTINATION" "$signature" "$pending"
+      return
+    fi
+    if [[ -e "$ARCHIVE_DESTINATION" || -L "$ARCHIVE_DESTINATION" ]]; then
+      select_archive_destination "$source"
+      write_archive_pending "$pending" "$signature" "$(basename -- "$ARCHIVE_DESTINATION")" || {
+        cleanup_active_archive_temp
+        return 1
+      }
+      continue
+    fi
+    if ! mv -nT -- "$temp" "$ARCHIVE_DESTINATION"; then
+      if [[ -e "$ARCHIVE_DESTINATION" || -L "$ARCHIVE_DESTINATION" ]]; then
+        continue
+      fi
+      cleanup_active_archive_temp
+      return 1
+    fi
+    if [[ -e "$temp" || -L "$temp" ]]; then
+      continue
+    fi
+
+    ARCHIVE_ACTIVE_TEMP=""
+    remove_archived_source "$source" "$ARCHIVE_DESTINATION" "$signature" "$pending"
+    return
+  done
+}
+
+select_archive_destination() {
+  local source="$1" name stem extension candidate index=0
+  name="$(basename -- "$source")"
+  stem="${name%.*}"
+  extension=".${name##*.}"
+  while true; do
+    if ((index == 0)); then
+      candidate="$GSR_REPLAY_ARCHIVE_DIR/$name"
+    else
+      candidate="$GSR_REPLAY_ARCHIVE_DIR/$stem ($index)$extension"
+    fi
+    if [[ -e "$candidate" || -L "$candidate" ]]; then
+      ((index += 1))
+      continue
+    fi
+    ARCHIVE_DESTINATION="$candidate"
+    return 0
+  done
+}
+
+remove_archived_source() {
+  local source="$1" destination="$2" signature="$3" pending="$4"
+  [[ -f "$source" && ! -L "$source" && -f "$destination" && ! -L "$destination" ]] || return 1
+  [[ "$(file_signature "$source" 2>/dev/null || true)" == "$signature" ]] || return 1
+  cmp -s -- "$source" "$destination" || return 1
+  sync -- "$destination" || return 1
+  sync -- "$(dirname -- "$destination")" || return 1
+  filesystem_available "$destination" "$GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID" || return 1
+  filesystem_available "$source" "$GSR_REPLAY_REQUIRED_FS_UUID" || return 1
+  [[ "$(file_signature "$source" 2>/dev/null || true)" == "$signature" ]] || return 1
+  cmp -s -- "$source" "$destination" || return 1
+  rm -- "$source" || return 1
+  sync -- "$(dirname -- "$source")" || return 1
+  rm -f -- "$pending" || return 1
+  sync -- "$(dirname -- "$pending")" || return 1
+}
+
+file_signature() {
+  stat -c '%d:%i:%s:%y:%z' -- "$1"
+}
+
+archive_pending_path() {
+  printf '%s/.%s%s\n' "$(dirname -- "$1")" "$(basename -- "$1")" "$ARCHIVE_PENDING_SUFFIX"
+}
+
+write_archive_pending() {
+  local pending="$1" signature="$2" destination_name="$3" temp archive_identity
+  archive_identity="$(archive_transaction_identity)" || return 1
+  temp="$(mktemp "$(dirname -- "$pending")/.gsr-replay-archive-pending.XXXXXX")" || return 1
+  chmod 600 "$temp" || {
+    rm -f -- "$temp"
+    return 1
+  }
+  if ! printf '%s\0%s\0%s\0' "$signature" "$destination_name" "$archive_identity" >"$temp" || ! sync -- "$temp" ||
+     ! mv -fT -- "$temp" "$pending" || ! sync -- "$(dirname -- "$pending")"; then
     rm -f -- "$temp"
     return 1
   fi
-  mv -- "$temp" "$destination"
-  rm -f -- "$source"
+}
+
+read_archive_pending() {
+  local pending="$1" expected_signature="$2" source="$3" signature destination_name archive_identity trailing=""
+  local expected_archive_identity
+  exec 7<"$pending" || return 1
+  IFS= read -r -d '' signature <&7 || {
+    exec 7<&-
+    return 1
+  }
+  IFS= read -r -d '' destination_name <&7 || {
+    exec 7<&-
+    return 1
+  }
+  IFS= read -r -d '' archive_identity <&7 || {
+    exec 7<&-
+    return 1
+  }
+  if IFS= read -r -n 1 trailing <&7 || [[ -n "$trailing" ]]; then
+    exec 7<&-
+    return 1
+  fi
+  exec 7<&-
+  [[ "$signature" == "$expected_signature" ]] || return 1
+  expected_archive_identity="$(archive_transaction_identity)" || return 1
+  [[ "$archive_identity" == "$expected_archive_identity" ]] || return 1
+  archive_destination_name_valid "$source" "$destination_name" || return 1
+  ARCHIVE_DESTINATION="$GSR_REPLAY_ARCHIVE_DIR/$destination_name"
+}
+
+archive_transaction_identity() {
+  local canonical_archive
+  [[ -d "$GSR_REPLAY_ARCHIVE_DIR" ]] || return 1
+  canonical_archive="$(realpath -e -- "$GSR_REPLAY_ARCHIVE_DIR")" || return 1
+  printf '%s\n%s' "$canonical_archive" "${GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID,,}"
+}
+
+archive_destination_name_valid() {
+  local source="$1" candidate="$2" name stem extension prefix suffix index
+  name="$(basename -- "$source")"
+  [[ "$candidate" == "$name" ]] && return 0
+  stem="${name%.*}"
+  extension=".${name##*.}"
+  prefix="$stem ("
+  suffix=")$extension"
+  [[ "$candidate" == "$prefix"* && "$candidate" == *"$suffix" ]] || return 1
+  index="${candidate#"$prefix"}"
+  index="${index%"$suffix"}"
+  [[ "$index" =~ ^[1-9][0-9]*$ ]]
+}
+
+cleanup_stale_media_temps() {
+  local file
+  local -a files=(
+    "$GSR_REPLAY_ARCHIVE_DIR"/.gsr-replay.*.part
+    "$GSR_REPLAY_DIR"/.gsr-replay-audio.*.mp4
+    "$GSR_REPLAY_DIR"/.gsr-replay-audio-pending.*
+    "$GSR_REPLAY_DIR"/.gsr-replay-archive-pending.*
+  )
+  for file in "${files[@]}"; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    rm -f -- "$file"
+  done
+  local -a pending_files=("$GSR_REPLAY_DIR"/.*"$ARCHIVE_PENDING_SUFFIX")
+  local pending source_name source
+  for pending in "${pending_files[@]}"; do
+    [[ -f "$pending" && ! -L "$pending" ]] || continue
+    source_name="$(basename -- "$pending")"
+    source_name="${source_name#.}"
+    source_name="${source_name%"$ARCHIVE_PENDING_SUFFIX"}"
+    source="$GSR_REPLAY_DIR/$source_name"
+    [[ -e "$source" || -L "$source" ]] || rm -f -- "$pending"
+  done
+  pending_files=("$GSR_REPLAY_DIR"/.*"$AUDIO_PENDING_SUFFIX")
+  for pending in "${pending_files[@]}"; do
+    [[ -f "$pending" && ! -L "$pending" ]] || continue
+    source_name="$(basename -- "$pending")"
+    source_name="${source_name#.}"
+    source_name="${source_name%"$AUDIO_PENDING_SUFFIX"}"
+    source="$GSR_REPLAY_DIR/$source_name"
+    [[ -e "$source" || -L "$source" ]] || rm -f -- "$pending"
+  done
+}
+
+cleanup_active_archive_temp() {
+  local temp="${ARCHIVE_ACTIVE_TEMP:-}"
+  [[ -n "$temp" && "$temp" == "$GSR_REPLAY_ARCHIVE_DIR"/.gsr-replay.*.part ]] || return 0
+  [[ ! -L "$temp" ]] || return 0
+  rm -f -- "$temp"
+  ARCHIVE_ACTIVE_TEMP=""
 }
 
 verify_output() {
@@ -359,8 +589,81 @@ verify_output() {
   load_config
   validate_config
   [[ "$GSR_REPLAY_DIR" == "$expected_dir" ]] || die "Replay output is $GSR_REPLAY_DIR, expected $expected_dir."
-  [[ "$GSR_REPLAY_REQUIRED_FS_UUID" == "$2" ]] || die "Replay filesystem UUID does not match the required integration."
+  [[ "${GSR_REPLAY_REQUIRED_FS_UUID,,}" == "${2,,}" ]] || die "Replay filesystem UUID does not match the required integration."
   output_filesystem_available || die "Required replay filesystem is not mounted."
+}
+
+recorder_info_value() {
+  local info="$1" expected="$2" key value
+  while IFS='|' read -r key value _; do
+    if [[ "$key" == "$expected" ]]; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+  done <<<"$info"
+  return 1
+}
+
+recorder_info_has_codec() {
+  local info="$1" expected="$2" line
+  while IFS= read -r line; do
+    [[ "$line" == "$expected" ]] && return 0
+  done <<<"$info"
+  return 1
+}
+
+ffmpeg_h264_nvenc_usable() {
+  timeout --signal=KILL 5 ffmpeg \
+    -nostdin -hide_banner -loglevel error \
+    -f lavfi -i 'color=size=64x64:rate=1' \
+    -frames:v 1 -an -c:v h264_nvenc -f null - \
+    </dev/null >/dev/null 2>&1
+}
+
+ffmpeg_h264_vulkan_usable() {
+  timeout --signal=KILL 5 ffmpeg \
+    -nostdin -hide_banner -loglevel error \
+    -init_hw_device vulkan=gsr_replay_probe:0 \
+    -filter_hw_device gsr_replay_probe \
+    -f lavfi -i 'color=size=64x64:rate=1' \
+    -vf 'format=nv12,hwupload' \
+    -frames:v 1 -an -c:v h264_vulkan -f null - \
+    </dev/null >/dev/null 2>&1
+}
+
+select_runtime_video_backend() {
+  local info vendor
+  RUNTIME_VIDEO_CODEC="$GSR_REPLAY_CODEC"
+  RUNTIME_VIDEO_ENCODER="gpu"
+
+  info="$(LC_ALL=C gpu-screen-recorder --info 2>/dev/null || true)"
+  vendor="$(recorder_info_value "$info" vendor || true)"
+  [[ "${vendor,,}" == "nvidia" ]] || return 0
+  case "$GSR_REPLAY_CODEC" in
+    auto | h264) ;;
+    *) return 0 ;;
+  esac
+
+  require_command ffmpeg
+  require_command timeout
+  if ffmpeg_h264_nvenc_usable; then
+    return 0
+  fi
+
+  if recorder_info_has_codec "$info" h264_vulkan && ffmpeg_h264_vulkan_usable; then
+    RUNTIME_VIDEO_CODEC="h264_vulkan"
+    printf '%s\n' 'Warning: NVIDIA NVENC is unavailable with the current FFmpeg/driver combination; using H.264 Vulkan GPU encoding.' >&2
+    return 0
+  fi
+
+  if recorder_info_has_codec "$info" h264_software; then
+    RUNTIME_VIDEO_CODEC="h264"
+    RUNTIME_VIDEO_ENCODER="cpu"
+    printf '%s\n' 'Warning: NVIDIA NVENC and H.264 Vulkan are unavailable; using CPU encoding. Performance may be reduced.' >&2
+    return 0
+  fi
+
+  die_permanent "No usable H.264 encoder is available. NVENC failed and GPU Screen Recorder reports neither Vulkan nor software H.264 support."
 }
 
 run_recorder() {
@@ -368,8 +671,11 @@ run_recorder() {
   load_config
   validate_config
   require_command gpu-screen-recorder
+  require_command flock
   prepare_output_dir
   [[ -x "$CALLBACK_PATH" ]] || die "Replay callback is missing. $REINSTALL_HINT"
+  clear_save_request
+  select_runtime_video_backend
 
   local -a args=(
     -w "$GSR_REPLAY_MONITOR"
@@ -380,7 +686,12 @@ run_recorder() {
     -replay-storage "$GSR_REPLAY_STORAGE"
     -bm cbr
     -q "$GSR_REPLAY_BITRATE"
-    -k "$GSR_REPLAY_CODEC"
+    -k "$RUNTIME_VIDEO_CODEC"
+  )
+  if [[ "$RUNTIME_VIDEO_ENCODER" == "cpu" ]]; then
+    args+=( -encoder cpu )
+  fi
+  args+=(
     -fm cfr
     -fallback-cpu-encoding yes
     -sc "$CALLBACK_PATH"
@@ -399,30 +710,80 @@ run_recorder() {
 }
 
 replay_saved() {
-  local file="${1:-}" type="${2:-replay}"
-  load_config
+  local file="${1:-}" type="${2:-replay}" audio_streams video_streams pending
   [[ -n "$file" && -f "$file" ]] || return 0
-  if [[ "$type" == "replay" && "$GSR_REPLAY_AUDIO" == "default_output" ]]; then
-    finalize_replay_audio "$file"
+  require_config
+  load_config
+  validate_config
+  if [[ "$type" == "replay" ]]; then
+    replay_file_is_managed "$file" || die "Saved replay is outside the configured output directory: $file"
+    filesystem_available "$file" "$GSR_REPLAY_REQUIRED_FS_UUID" || die "Saved replay is on the wrong filesystem: $file"
+    require_command flock
+    require_command ffprobe
+    require_command sync
+    mkdir -p "$CONFIG_DIR"
+    ensure_safe_lock_file "$MEDIA_LOCK_FILE"
+    exec 9>>"$MEDIA_LOCK_FILE"
+    flock 9
+    video_streams="$(media_stream_count "$file" v)" || {
+      notify "Replay validation failed" "The clip remains in $file and will be retried before archiving." critical 10000
+      return 1
+    }
+    if ((video_streams < 1)); then
+      notify "Replay validation failed" "The clip remains in $file and will be retried before archiving." critical 10000
+      return 1
+    fi
+    audio_streams="$(media_stream_count "$file" a)" || {
+      notify "Replay validation failed" "The clip remains in $file and will be retried before archiving." critical 10000
+      return 1
+    }
+    if ((audio_streams > 1)); then
+      ensure_audio_pending "$file" true || return 1
+      if ! finalize_replay_audio "$file" "$AUDIO_PENDING_PATH"; then
+        notify "Replay audio processing failed" "The original clip remains in $file and will be retried before archiving." critical 10000
+        return 1
+      fi
+    else
+      pending="$(audio_pending_path "$file")"
+      if [[ -L "$pending" || ( -e "$pending" && ! -f "$pending" ) ]]; then
+        return 1
+      fi
+      [[ ! -f "$pending" ]] || complete_audio_pending "$pending" || return 1
+      consume_save_request "$file"
+    fi
   fi
   notify "Replay clip saved" "$file" normal 7000
 }
 
 finalize_replay_audio() {
-  local file="$1" temp duration rounded_duration fraction end_time start_time microphone_intervals filter
+  local file="$1" pending="$2" temp duration whole_duration rounded_duration fraction end_time start_time
+  local microphone_intervals filter source_signature audio_streams video_streams
   require_command ffmpeg
   require_command ffprobe
-  duration="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$file")"
+  require_command sync
+  [[ -f "$file" && ! -L "$file" && -f "$pending" && ! -L "$pending" ]] || return 1
+  filesystem_available "$file" "$GSR_REPLAY_REQUIRED_FS_UUID" || return 1
+  audio_streams="$(media_stream_count "$file" a)" || return 1
+  if ((audio_streams <= 1)); then
+    complete_audio_pending "$pending"
+    return
+  fi
+  ((audio_streams == 2)) || return 1
+
+  source_signature="$(file_signature "$file")" || return 1
+  read_audio_pending "$pending" "$source_signature" || return 1
+  end_time="$(save_record_timestamp "$AUDIO_PENDING_RECORD")" || return 1
+  duration="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 -- "$file")" || return 1
   [[ "$duration" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
-  rounded_duration="${duration%%.*}"
+  whole_duration="${duration%%.*}"
+  rounded_duration="$((10#$whole_duration))"
   fraction="${duration#*.}"
-  if [[ "$duration" != "$rounded_duration" && ! "$fraction" =~ ^0+$ ]]; then
+  if [[ "$duration" == *.* && ! "$fraction" =~ ^0+$ ]]; then
     ((rounded_duration += 1))
   fi
-  end_time="$(replay_save_request_time)"
   start_time="$((end_time - rounded_duration))"
-  microphone_intervals="$(microphone_enable_expression "$start_time" "$end_time" "$duration")"
-  temp="$(mktemp "$(dirname -- "$file")/.gsr-replay-audio.XXXXXX.mp4")"
+  microphone_intervals="$(microphone_enable_expression "$start_time" "$end_time" "$duration")" || return 1
+  temp="$(mktemp "$(dirname -- "$file")/.gsr-replay-audio.XXXXXX.mp4")" || return 1
 
   if [[ -n "$microphone_intervals" ]]; then
     filter="[0:a:1]volume='if(gt(${microphone_intervals},0),1,0)':eval=frame[mic];[0:a:0][mic]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.95[a]"
@@ -437,30 +798,272 @@ finalize_replay_audio() {
     rm -f -- "$temp"
     return 1
   fi
-  mv -- "$temp" "$file"
-  rm -f -- "$SAVE_REQUEST_TIME_FILE"
+  video_streams="$(media_stream_count "$temp" v)" || {
+    rm -f -- "$temp"
+    return 1
+  }
+  audio_streams="$(media_stream_count "$temp" a)" || {
+    rm -f -- "$temp"
+    return 1
+  }
+  if ((video_streams < 1 || audio_streams != 1)) || [[ ! -s "$temp" ]] ||
+     [[ "$(file_signature "$file" 2>/dev/null || true)" != "$source_signature" ]] ||
+     ! chmod --reference="$file" -- "$temp" || ! touch -r "$file" -- "$temp" ||
+     ! sync -- "$temp" ||
+     ! filesystem_available "$file" "$GSR_REPLAY_REQUIRED_FS_UUID" ||
+     [[ "$(file_signature "$file" 2>/dev/null || true)" != "$source_signature" ]] ||
+     ! mv -fT -- "$temp" "$file" ||
+     ! sync -- "$file" || ! sync -- "$(dirname -- "$file")"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+  complete_audio_pending "$pending"
 }
 
-replay_save_request_time() {
-  local timestamp=""
-  if [[ -f "$SAVE_REQUEST_TIME_FILE" ]]; then
-    timestamp="$(<"$SAVE_REQUEST_TIME_FILE")"
+prepare_replay_for_archive() {
+  local file="$1" pending audio_streams video_streams
+  pending="$(audio_pending_path "$file")"
+  filesystem_available "$file" "$GSR_REPLAY_REQUIRED_FS_UUID" || return 1
+  if [[ -L "$pending" || ( -e "$pending" && ! -f "$pending" ) ]]; then
+    return 1
   fi
-  if [[ "$timestamp" =~ ^[0-9]+$ ]]; then
-    printf '%s\n' "$timestamp"
+  video_streams="$(media_stream_count "$file" v)" || return 1
+  ((video_streams >= 1)) || return 1
+  audio_streams="$(media_stream_count "$file" a)" || return 1
+  if ((audio_streams <= 1)); then
+    [[ ! -f "$pending" ]] || complete_audio_pending "$pending"
+    return
+  fi
+  ensure_audio_pending "$file" false || return 1
+  finalize_replay_audio "$file" "$AUDIO_PENDING_PATH"
+}
+
+media_stream_count() {
+  local file="$1" selector="$2" output line count=0
+  output="$(ffprobe -v error -select_streams "$selector" -show_entries stream=index -of csv=p=0 -- "$file")" || return 1
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && ((count += 1))
+  done <<< "$output"
+  printf '%s\n' "$count"
+}
+
+audio_pending_path() {
+  printf '%s/.%s%s\n' "$(dirname -- "$1")" "$(basename -- "$1")" "$AUDIO_PENDING_SUFFIX"
+}
+
+ensure_audio_pending() {
+  local file="$1" claim_request="$2" pending record="" timestamp current="" source_signature
+  pending="$(audio_pending_path "$file")"
+  source_signature="$(file_signature "$file")" || return 1
+  if [[ -f "$pending" && ! -L "$pending" ]]; then
+    if read_audio_pending "$pending" "$source_signature"; then
+      record="$AUDIO_PENDING_RECORD"
+    else
+      rm -f -- "$pending" || return 1
+      sync -- "$(dirname -- "$pending")" || return 1
+    fi
+  elif [[ -e "$pending" || -L "$pending" ]]; then
+    return 1
+  fi
+
+  mkdir -p "$CONFIG_DIR"
+  ensure_safe_lock_file "$SAVE_REQUEST_LOCK_FILE"
+  exec 8>>"$SAVE_REQUEST_LOCK_FILE"
+  flock 8
+  if [[ -f "$SAVE_REQUEST_TIME_FILE" && ! -L "$SAVE_REQUEST_TIME_FILE" ]]; then
+    current="$(<"$SAVE_REQUEST_TIME_FILE")"
+  elif [[ -e "$SAVE_REQUEST_TIME_FILE" || -L "$SAVE_REQUEST_TIME_FILE" ]]; then
+    flock -u 8
+    exec 8>&-
+    return 1
+  fi
+  if [[ -n "$record" ]]; then
+    if [[ "$current" == "$record" ]]; then
+      if ! rm -f -- "$SAVE_REQUEST_TIME_FILE" || ! sync -- "$CONFIG_DIR"; then
+        flock -u 8
+        exec 8>&-
+        return 1
+      fi
+    fi
+    flock -u 8
+    exec 8>&-
+    AUDIO_PENDING_PATH="$pending"
+    return 0
+  fi
+
+  if [[ "$claim_request" == "true" ]] && save_request_matches_file "$current" "$file"; then
+    record="$current"
   else
-    date +%s
+    timestamp="$(infer_replay_end_time "$file")" || {
+      flock -u 8
+      exec 8>&-
+      return 1
+    }
+    record="$timestamp|inferred"
   fi
+
+  if ! write_audio_pending "$pending" "$record" "$source_signature"; then
+    flock -u 8
+    exec 8>&-
+    return 1
+  fi
+  if [[ -e "$SAVE_REQUEST_TIME_FILE" && "$current" == "$record" ]]; then
+    if ! rm -f -- "$SAVE_REQUEST_TIME_FILE" || ! sync -- "$CONFIG_DIR"; then
+      flock -u 8
+      exec 8>&-
+      return 1
+    fi
+  fi
+  flock -u 8
+  exec 8>&-
+  AUDIO_PENDING_PATH="$pending"
+}
+
+write_audio_pending() {
+  local pending="$1" record="$2" signature="$3" temp
+  temp="$(mktemp "$(dirname -- "$pending")/.gsr-replay-audio-pending.XXXXXX")" || return 1
+  chmod 600 "$temp" || {
+    rm -f -- "$temp"
+    return 1
+  }
+  if ! printf '%s\0%s\0' "$record" "$signature" >"$temp" || ! sync -- "$temp" ||
+     ! mv -fT -- "$temp" "$pending" || ! sync -- "$(dirname -- "$pending")"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+}
+
+read_audio_pending() {
+  local pending="$1" expected_signature="$2" record signature trailing=""
+  AUDIO_PENDING_RECORD=""
+  exec 7<"$pending" || return 1
+  IFS= read -r -d '' record <&7 || {
+    exec 7<&-
+    return 1
+  }
+  IFS= read -r -d '' signature <&7 || {
+    exec 7<&-
+    return 1
+  }
+  if IFS= read -r -n 1 trailing <&7 || [[ -n "$trailing" ]]; then
+    exec 7<&-
+    return 1
+  fi
+  exec 7<&-
+  save_record_timestamp "$record" >/dev/null || return 1
+  [[ "$signature" == "$expected_signature" ]] || return 1
+  AUDIO_PENDING_RECORD="$record"
+}
+
+complete_audio_pending() {
+  local pending="$1"
+  rm -- "$pending" || return 1
+  sync -- "$(dirname -- "$pending")"
+}
+
+save_record_timestamp() {
+  local record="$1" timestamp
+  [[ "$record" =~ ^[0-9]{1,12}(\|[[:alnum:]_.:-]{1,128})?$ ]] || return 1
+  timestamp="${record%%|*}"
+  printf '%s\n' "$((10#$timestamp))"
+}
+
+infer_replay_end_time() {
+  local file="$1" birth name parsed modified
+  name="$(basename -- "$file")"
+  if [[ "$name" =~ ^Replay_([0-9]{4})-([0-9]{2})-([0-9]{2})_([0-9]{2})-([0-9]{2})-([0-9]{2}) ]]; then
+    parsed="$(date -d "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}" +%s 2>/dev/null || true)"
+    if [[ "$parsed" =~ ^[0-9]{1,12}$ ]]; then
+      printf '%s\n' "$((10#$parsed))"
+      return 0
+    fi
+  fi
+  birth="$(stat -c %W -- "$file" 2>/dev/null || true)"
+  if [[ "$birth" =~ ^[0-9]{1,12}$ ]] && ((10#$birth > 0)); then
+    printf '%s\n' "$((10#$birth))"
+    return 0
+  fi
+  modified="$(stat -c %Y -- "$file" 2>/dev/null || true)"
+  [[ "$modified" =~ ^[0-9]{1,12}$ ]] || return 1
+  printf '%s\n' "$((10#$modified))"
+}
+
+replay_file_is_managed() {
+  local file="$1" canonical_file canonical_output
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  canonical_file="$(realpath -e -- "$file")" || return 1
+  canonical_output="$(realpath -e -- "$GSR_REPLAY_DIR")" || return 1
+  [[ "$(dirname -- "$canonical_file")" == "$canonical_output" ]]
+}
+
+save_request_matches_file() {
+  local record="$1" file="$2" request_time file_time difference
+  request_time="$(save_record_timestamp "$record" 2>/dev/null)" || return 1
+  file_time="$(infer_replay_end_time "$file")" || return 1
+  difference="$((request_time - file_time))"
+  ((difference >= 0)) || difference="$((-difference))"
+  ((difference <= SAVE_REQUEST_MATCH_WINDOW_SECONDS))
+}
+
+consume_save_request() {
+  local file="$1" current=""
+  mkdir -p "$CONFIG_DIR"
+  ensure_safe_lock_file "$SAVE_REQUEST_LOCK_FILE"
+  exec 8>>"$SAVE_REQUEST_LOCK_FILE"
+  flock 8
+  if [[ -f "$SAVE_REQUEST_TIME_FILE" && ! -L "$SAVE_REQUEST_TIME_FILE" ]]; then
+    current="$(<"$SAVE_REQUEST_TIME_FILE")"
+    if save_request_matches_file "$current" "$file"; then
+      if ! rm -f -- "$SAVE_REQUEST_TIME_FILE" || ! sync -- "$CONFIG_DIR"; then
+        flock -u 8
+        exec 8>&-
+        return 1
+      fi
+    fi
+  elif [[ -e "$SAVE_REQUEST_TIME_FILE" || -L "$SAVE_REQUEST_TIME_FILE" ]]; then
+    flock -u 8
+    exec 8>&-
+    return 1
+  fi
+  flock -u 8
+  exec 8>&-
+}
+
+clear_save_request() {
+  local file changed=false
+  mkdir -p "$CONFIG_DIR"
+  ensure_safe_lock_file "$SAVE_REQUEST_LOCK_FILE"
+  exec 8>>"$SAVE_REQUEST_LOCK_FILE"
+  flock 8
+  if [[ -L "$SAVE_REQUEST_TIME_FILE" || ( -e "$SAVE_REQUEST_TIME_FILE" && ! -f "$SAVE_REQUEST_TIME_FILE" ) ]]; then
+    die "Replay save state is not a regular file: $SAVE_REQUEST_TIME_FILE"
+  fi
+  if [[ -f "$SAVE_REQUEST_TIME_FILE" ]]; then
+    rm -f -- "$SAVE_REQUEST_TIME_FILE" || die "Could not clear replay save state: $SAVE_REQUEST_TIME_FILE"
+    changed=true
+  fi
+  local -a files=("$CONFIG_DIR"/.save-request-time.*)
+  for file in "${files[@]}"; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    rm -f -- "$file" || die "Could not clear temporary replay save state: $file"
+    changed=true
+  done
+  [[ "$changed" == "false" ]] || sync -- "$CONFIG_DIR" || die "Could not synchronize replay save state."
+  flock -u 8
+  exec 8>&-
 }
 
 microphone_enable_expression() {
   local clip_start="$1" clip_end="$2" duration="$3"
-  local timestamp state mode="desktop-only" interval_start="" expression="" relative_start relative_end
-  [[ -f "$AUDIO_STATE_LOG" ]] || return 0
+  local timestamp state mode="desktop-only" interval_start="" expression="" relative_start relative_end sorted_states
+  [[ ! -e "$AUDIO_STATE_LOG" && ! -L "$AUDIO_STATE_LOG" ]] && return 0
+  [[ -f "$AUDIO_STATE_LOG" && ! -L "$AUDIO_STATE_LOG" ]] || return 1
+  sorted_states="$(sort -s -t '|' -k1,1n -- "$AUDIO_STATE_LOG")" || return 1
 
   while IFS='|' read -r timestamp state; do
-    [[ "$timestamp" =~ ^[0-9]+$ ]] || continue
+    [[ "$timestamp" =~ ^[0-9]{1,12}$ ]] || continue
     [[ "$state" == "desktop-only" || "$state" == "desktop-with-microphone" ]] || continue
+    timestamp="$((10#$timestamp))"
     if ((timestamp <= clip_start)); then
       mode="$state"
       continue
@@ -475,7 +1078,7 @@ microphone_enable_expression() {
       interval_start="$((timestamp - clip_start))"
     fi
     mode="$state"
-  done <"$AUDIO_STATE_LOG"
+  done <<< "$sorted_states"
 
   if [[ "$mode" == "desktop-with-microphone" ]]; then
     relative_start="${interval_start:-0}"
@@ -498,13 +1101,69 @@ save_replay() {
     die "Replay buffer was not running. It has been started; try again in a moment."
   fi
 
-  mkdir -p "$CONFIG_DIR"
-  local save_time_temp
-  save_time_temp="$(mktemp "$CONFIG_DIR/.save-request-time.XXXXXX")"
-  date +%s >"$save_time_temp"
-  mv "$save_time_temp" "$SAVE_REQUEST_TIME_FILE"
-  systemctl --user kill --kill-whom=main --signal=SIGUSR1 "$SERVICE_NAME"
+  require_command flock
+  require_command sync
+  create_save_request
+  if ! systemctl --user kill --kill-whom=main --signal=SIGUSR1 "$SERVICE_NAME"; then
+    remove_save_request "$SAVE_REQUEST_RECORD"
+    die "Could not request a replay save."
+  fi
   printf 'Replay save requested.\n'
+}
+
+create_save_request() {
+  local now current="" current_timestamp age temp record
+  mkdir -p "$CONFIG_DIR"
+  ensure_safe_lock_file "$SAVE_REQUEST_LOCK_FILE"
+  exec 8>>"$SAVE_REQUEST_LOCK_FILE"
+  flock 8
+  now="$(date +%s)"
+  if [[ -f "$SAVE_REQUEST_TIME_FILE" && ! -L "$SAVE_REQUEST_TIME_FILE" ]]; then
+    current="$(<"$SAVE_REQUEST_TIME_FILE")"
+    if current_timestamp="$(save_record_timestamp "$current" 2>/dev/null)"; then
+      age="$((10#$now - current_timestamp))"
+      if ((age >= 0 && age < SAVE_REQUEST_TIMEOUT_SECONDS)); then
+        die "A replay save is already in progress. Try again after it finishes."
+      fi
+    fi
+    rm -f -- "$SAVE_REQUEST_TIME_FILE"
+  elif [[ -e "$SAVE_REQUEST_TIME_FILE" || -L "$SAVE_REQUEST_TIME_FILE" ]]; then
+    die "Replay save state is not a regular file: $SAVE_REQUEST_TIME_FILE"
+  fi
+
+  record="$((10#$now))|${BASHPID:-$$}:$RANDOM"
+  temp="$(mktemp "$CONFIG_DIR/.save-request-time.XXXXXX")" || return 1
+  chmod 600 "$temp" || {
+    rm -f -- "$temp"
+    return 1
+  }
+  if ! printf '%s\n' "$record" >"$temp" || ! sync -- "$temp" ||
+     ! mv -fT -- "$temp" "$SAVE_REQUEST_TIME_FILE" || ! sync -- "$CONFIG_DIR"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+  SAVE_REQUEST_RECORD="$record"
+  flock -u 8
+  exec 8>&-
+}
+
+remove_save_request() {
+  local expected="$1" current=""
+  ensure_safe_lock_file "$SAVE_REQUEST_LOCK_FILE"
+  exec 8>>"$SAVE_REQUEST_LOCK_FILE"
+  flock 8
+  if [[ -f "$SAVE_REQUEST_TIME_FILE" && ! -L "$SAVE_REQUEST_TIME_FILE" ]]; then
+    current="$(<"$SAVE_REQUEST_TIME_FILE")"
+    if [[ "$current" == "$expected" ]]; then
+      if ! rm -f -- "$SAVE_REQUEST_TIME_FILE" || ! sync -- "$CONFIG_DIR"; then
+        flock -u 8
+        exec 8>&-
+        return 1
+      fi
+    fi
+  fi
+  flock -u 8
+  exec 8>&-
 }
 
 service_command() {
@@ -533,24 +1192,33 @@ service_active() {
   command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet "$SERVICE_NAME"
 }
 
-service_fragment() {
-  systemctl --user show "$SERVICE_NAME" --property=FragmentPath --value 2>/dev/null
+unit_fragment() {
+  systemctl --user show "$1" --property=FragmentPath --value 2>/dev/null
 }
 
-service_dropins() {
-  systemctl --user show "$SERVICE_NAME" --property=DropInPaths --value 2>/dev/null
+unit_dropins() {
+  systemctl --user show "$1" --property=DropInPaths --value 2>/dev/null
 }
 
 verify_service_unit() {
-  [[ -f "$SERVICE_PATH" ]] || die "The user service is not installed. $REINSTALL_HINT"
+  verify_unit_file "$SERVICE_NAME" "$SERVICE_PATH" "user service"
+  verify_unit_file "$AUDIO_MONITOR_SERVICE_NAME" "$AUDIO_MONITOR_SERVICE_PATH" "audio monitor service"
+}
 
-  local fragment expected dropins
-  fragment="$(service_fragment)" || die "Could not inspect the loaded user service."
-  [[ -n "$fragment" ]] || die "The user service is installed but not loaded. Run 'systemctl --user daemon-reload' and try again."
-  expected="$(realpath "$SERVICE_PATH")"
-  [[ "$fragment" == "$expected" ]] || die "The loaded user service is $fragment, but this installation expects $expected. Remove or migrate the overriding unit, run 'systemctl --user daemon-reload', and try again."
-  dropins="$(service_dropins)" || die "Could not inspect user service drop-ins."
-  [[ -z "$dropins" ]] || die "The loaded user service has unsupported drop-ins: $dropins. Remove them, run 'systemctl --user daemon-reload', and try again."
+verify_archive_units() {
+  verify_unit_file "$ARCHIVE_SERVICE_NAME" "$ARCHIVE_SERVICE_PATH" "archive service"
+  verify_unit_file "$ARCHIVE_TIMER_NAME" "$ARCHIVE_TIMER_PATH" "archive timer"
+}
+
+verify_unit_file() {
+  local unit="$1" path="$2" label="$3" fragment expected dropins
+  [[ -f "$path" ]] || die "The $label is not installed. $REINSTALL_HINT"
+  fragment="$(unit_fragment "$unit")" || die "Could not inspect the loaded $label."
+  [[ -n "$fragment" ]] || die "The $label is installed but not loaded. Run 'systemctl --user daemon-reload' and try again."
+  expected="$(realpath "$path")"
+  [[ "$fragment" == "$expected" ]] || die "The loaded $label is $fragment, but this installation expects $expected. Remove or migrate the overriding unit, run 'systemctl --user daemon-reload', and try again."
+  dropins="$(unit_dropins "$unit")" || die "Could not inspect $label drop-ins."
+  [[ -z "$dropins" ]] || die "The loaded $label has unsupported drop-ins: $dropins. Remove them, run 'systemctl --user daemon-reload', and try again."
 }
 
 past_tense() {
@@ -607,6 +1275,15 @@ doctor() {
   check_command gpu-screen-recorder true || ((errors += 1))
   check_command systemctl true || ((errors += 1))
   check_command ffmpeg true || ((errors += 1))
+  check_command ffprobe true || ((errors += 1))
+  check_command flock true || ((errors += 1))
+  check_command sync true || ((errors += 1))
+  if [[ -n "$GSR_REPLAY_REQUIRED_FS_UUID" || -n "$GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID" ]]; then
+    check_command findmnt true || ((errors += 1))
+  fi
+  if [[ "$GSR_REPLAY_AUDIO" == "default_output" ]]; then
+    check_command pactl true || ((errors += 1))
+  fi
   check_command notify-send false || true
   check_command waybar false || true
 
@@ -621,29 +1298,8 @@ doctor() {
     ((errors += 1))
   fi
 
-  if [[ -f "$SERVICE_PATH" ]]; then
-    local fragment expected dropins
-    fragment="$(service_fragment || true)"
-    expected="$(realpath "$SERVICE_PATH")"
-    if [[ -z "$fragment" ]]; then
-      check_error "User service" "Installed at $expected but not loaded."
-      ((errors += 1))
-    elif [[ "$fragment" != "$expected" ]]; then
-      check_error "User service" "Loaded from $fragment; expected $expected."
-      ((errors += 1))
-    else
-      dropins="$(service_dropins || true)"
-      if [[ -n "$dropins" ]]; then
-        check_error "User service" "Unsupported drop-ins: $dropins"
-        ((errors += 1))
-      else
-        check_ok "User service" "$expected"
-      fi
-    fi
-  else
-    check_error "User service" "Missing. $REINSTALL_HINT"
-    ((errors += 1))
-  fi
+  check_unit_file "$SERVICE_NAME" "$SERVICE_PATH" "User service" || ((errors += 1))
+  check_unit_file "$AUDIO_MONITOR_SERVICE_NAME" "$AUDIO_MONITOR_SERVICE_PATH" "Audio monitor" || ((errors += 1))
 
   if [[ -x "$CALLBACK_PATH" ]]; then
     check_ok "Replay callback" "$CALLBACK_PATH"
@@ -693,6 +1349,48 @@ doctor() {
     check_ok "Output filesystem" "$GSR_REPLAY_REQUIRED_FS_UUID"
   fi
 
+  if [[ -n "$GSR_REPLAY_ARCHIVE_DIR" ]]; then
+    check_command cmp true || ((errors += 1))
+    check_unit_file "$ARCHIVE_SERVICE_NAME" "$ARCHIVE_SERVICE_PATH" "Archive service" || ((errors += 1))
+    check_unit_file "$ARCHIVE_TIMER_NAME" "$ARCHIVE_TIMER_PATH" "Archive timer unit" || ((errors += 1))
+    if [[ -L "$GSR_REPLAY_ARCHIVE_DIR" && ! -e "$GSR_REPLAY_ARCHIVE_DIR" ]]; then
+      check_error "Archive directory" "$GSR_REPLAY_ARCHIVE_DIR points to a missing target."
+      ((errors += 1))
+    elif [[ -e "$GSR_REPLAY_ARCHIVE_DIR" && ! -d "$GSR_REPLAY_ARCHIVE_DIR" ]]; then
+      check_error "Archive directory" "$GSR_REPLAY_ARCHIVE_DIR is not a directory."
+      ((errors += 1))
+    elif [[ -e "$GSR_REPLAY_ARCHIVE_DIR" && ! -w "$GSR_REPLAY_ARCHIVE_DIR" ]]; then
+      check_error "Archive directory" "$GSR_REPLAY_ARCHIVE_DIR is not writable."
+      ((errors += 1))
+    else
+      local archive_parent="$GSR_REPLAY_ARCHIVE_DIR"
+      while [[ ! -e "$archive_parent" && "$archive_parent" != "/" ]]; do
+        archive_parent="$(dirname -- "$archive_parent")"
+      done
+      if [[ -d "$archive_parent" && -w "$archive_parent" ]]; then
+        check_ok "Archive directory" "$GSR_REPLAY_ARCHIVE_DIR"
+      else
+        check_error "Archive directory" "Cannot create $GSR_REPLAY_ARCHIVE_DIR."
+        ((errors += 1))
+      fi
+    fi
+    if ! filesystem_available "$GSR_REPLAY_ARCHIVE_DIR" "$GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID"; then
+      check_error "Archive filesystem" "Required UUID $GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID is not mounted."
+      ((errors += 1))
+    elif [[ -n "$GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID" ]]; then
+      check_ok "Archive filesystem" "$GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID"
+    else
+      check_warn "Archive filesystem" "No filesystem UUID is pinned."
+    fi
+    if systemctl --user is-enabled --quiet "$ARCHIVE_TIMER_NAME" &&
+       systemctl --user is-active --quiet "$ARCHIVE_TIMER_NAME"; then
+      check_ok "Archive timer" "Enabled and active"
+    else
+      check_error "Archive timer" "Not enabled and active. Run 'gsr-replay setup'."
+      ((errors += 1))
+    fi
+  fi
+
   if service_active; then
     check_ok "Replay buffer" "Active"
   else
@@ -720,6 +1418,30 @@ check_command() {
   return 1
 }
 
+check_unit_file() {
+  local unit="$1" path="$2" label="$3" fragment expected dropins
+  if [[ ! -f "$path" ]]; then
+    check_error "$label" "Missing. $REINSTALL_HINT"
+    return 1
+  fi
+  expected="$(realpath "$path")"
+  fragment="$(unit_fragment "$unit" || true)"
+  if [[ -z "$fragment" ]]; then
+    check_error "$label" "Installed at $expected but not loaded."
+    return 1
+  fi
+  if [[ "$fragment" != "$expected" ]]; then
+    check_error "$label" "Loaded from $fragment; expected $expected."
+    return 1
+  fi
+  dropins="$(unit_dropins "$unit" || true)"
+  if [[ -n "$dropins" ]]; then
+    check_error "$label" "Unsupported drop-ins: $dropins"
+    return 1
+  fi
+  check_ok "$label" "$expected"
+}
+
 check_ok() { printf '[OK]    %-18s %s\n' "$1" "$2"; }
 check_warn() { printf '[WARN]  %-18s %s\n' "$1" "$2"; }
 check_error() { printf '[ERROR] %-18s %s\n' "$1" "$2"; }
@@ -730,6 +1452,7 @@ setup() {
   systemctl --user show-environment >/dev/null 2>&1 || die "The systemd user manager is unavailable."
   systemctl --user daemon-reload
   verify_service_unit
+  verify_archive_units
   load_config
   local previous_hyprland_config="$GSR_REPLAY_HYPRLAND_CONFIG"
   local previous_hyprland_toggle_bind="$GSR_REPLAY_HYPRLAND_TOGGLE_BIND"
@@ -958,7 +1681,6 @@ choose_storage() {
 
 configure_archive() {
   local enabled=false delay_minutes detected_uuid
-  local previous_archive_dir="$GSR_REPLAY_ARCHIVE_DIR"
   [[ -n "$GSR_REPLAY_ARCHIVE_DIR" ]] && enabled=true
   ask_yes_no enabled "Move saved clips to archive storage after a delay?" "$enabled"
   if [[ "$enabled" == "false" ]]; then
@@ -971,21 +1693,20 @@ configure_archive() {
   [[ -n "$GSR_REPLAY_ARCHIVE_DIR" ]] || GSR_REPLAY_ARCHIVE_DIR="$HOME/Videos/replay-archive"
   ask_text GSR_REPLAY_ARCHIVE_DIR "Replay archive directory" "$GSR_REPLAY_ARCHIVE_DIR" validate_nonempty
   GSR_REPLAY_ARCHIVE_DIR="$(expand_home "$GSR_REPLAY_ARCHIVE_DIR")"
-  delay_minutes="$((GSR_REPLAY_ARCHIVE_AFTER_SECONDS / 60))"
+  [[ -d "$GSR_REPLAY_ARCHIVE_DIR" && -w "$GSR_REPLAY_ARCHIVE_DIR" ]] ||
+    die "Replay archive directory must already exist and be writable. Mount the archive filesystem, create $GSR_REPLAY_ARCHIVE_DIR, and run setup again."
+  delay_minutes="$((10#$GSR_REPLAY_ARCHIVE_AFTER_SECONDS / 60))"
   ask_integer delay_minutes "Archive delay in minutes" "$delay_minutes" 1 10080
   GSR_REPLAY_ARCHIVE_AFTER_SECONDS="$((delay_minutes * 60))"
   detected_uuid="$(filesystem_uuid_for_path "$GSR_REPLAY_ARCHIVE_DIR")"
-  if [[ -n "$detected_uuid" ]]; then
-    GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID="$detected_uuid"
-  elif [[ "$GSR_REPLAY_ARCHIVE_DIR" != "$previous_archive_dir" ]]; then
-    GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID=""
-  fi
+  [[ -n "$detected_uuid" ]] || die "Could not detect a filesystem UUID for $GSR_REPLAY_ARCHIVE_DIR. Choose mounted archive storage with a stable UUID."
+  GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID="$detected_uuid"
 }
 
 select_option() {
   local output_name="$1" prompt="$2" default_index="$3"
   local -n option_labels="$4" option_values="$5"
-  local answer i
+  local answer i selected_index
 
   printf '\n%s\n' "$prompt"
   for i in "${!option_labels[@]}"; do
@@ -994,10 +1715,13 @@ select_option() {
   while true; do
     read -r -p "Select an option [$default_index]: " answer
     answer="${answer:-$default_index}"
-    if [[ "$answer" =~ ^[0-9]+$ ]] && ((answer >= 1 && answer <= ${#option_values[@]})); then
-      printf -v "$output_name" '%s' "${option_values[$((answer - 1))]}"
-      REPLY_INDEX="$answer"
-      return
+    if [[ "$answer" =~ ^[0-9]+$ && ${#answer} -le 9 ]]; then
+      selected_index="$((10#$answer))"
+      if ((selected_index >= 1 && selected_index <= ${#option_values[@]})); then
+        printf -v "$output_name" '%s' "${option_values[$((selected_index - 1))]}"
+        REPLY_INDEX="$selected_index"
+        return
+      fi
     fi
     printf 'Please enter a number between 1 and %s.\n' "${#option_values[@]}"
   done
@@ -2051,9 +2775,28 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "Required command is missing: $1"
 }
 
+ensure_safe_lock_file() {
+  ensure_regular_state_file "$1" "Lock file"
+}
+
+ensure_regular_state_file() {
+  local path="$1" label="$2"
+  if [[ -L "$path" || ( -e "$path" && ! -f "$path" ) ]]; then
+    die "$label is not a regular file: $path"
+  fi
+  : >>"$path" || die "Could not create $label: $path"
+  [[ -f "$path" && ! -L "$path" ]] || die "$label is not a regular file: $path"
+  chmod 600 -- "$path" || die "Could not secure $label: $path"
+}
+
 die() {
   printf 'Error: %s\n' "$*" >&2
   exit 1
+}
+
+die_permanent() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 78
 }
 
 main "$@"
