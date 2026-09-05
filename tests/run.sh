@@ -113,7 +113,9 @@ EOF
   unset FAKE_ARCHIVE_TIMER_FRAGMENT FAKE_ARCHIVE_TIMER_DROPINS
   unset FAKE_PACTL_DEFAULT_SINK FAKE_PACTL_PORT FAKE_FFMPEG_LOG FAKE_FFMPEG_FAIL FAKE_FFPROBE_AUDIO_STREAMS
   unset FAKE_FFPROBE_VIDEO_STREAMS FAKE_FFPROBE_NO_VIDEO_FILE
+  unset FAKE_FFPROBE_LOG FAKE_FFPROBE_FAIL_FILE FAKE_FFPROBE_DURATION FAKE_FFPROBE_TEMP_AUDIO_STREAMS
   unset FAKE_FINDMNT_UUID FAKE_FINDMNT_SOURCE_PREFIX FAKE_FINDMNT_SOURCE_UUID FAKE_FINDMNT_ARCHIVE_PREFIX FAKE_FINDMNT_ARCHIVE_UUID
+  unset FAKE_ARCHIVE_RECOVERED_SOURCE FAKE_ARCHIVE_REAL_CP
   unset FAKE_HYPR_STATE FAKE_HYPR_ERRORS_BEFORE FAKE_HYPR_ERRORS_AFTER HYPRLAND_INSTANCE_SIGNATURE
 }
 
@@ -284,23 +286,23 @@ make_fake_ffprobe() {
 #!/usr/bin/env bash
 set -u
 file="${!#}"
+[[ -z "${FAKE_FFPROBE_LOG:-}" ]] || printf '%s\n' "$file" >>"$FAKE_FFPROBE_LOG"
+if [[ "${file##*/}" == "${FAKE_FFPROBE_FAIL_FILE:-__never__}" ]]; then
+  exit 1
+fi
 case "$*" in
-  *format=duration*)
-    printf '%s\n' "${FAKE_FFPROBE_DURATION:-120.0}"
-    ;;
-  *"-select_streams a"*)
-    streams="${FAKE_FFPROBE_AUDIO_STREAMS:-2}"
-    [[ "$(basename -- "$file")" == .gsr-replay-audio.*.mp4 ]] && streams=1
-    for ((index = 0; index < streams; index += 1)); do
-      printf '%s\n' "$index"
+  *stream=codec_type:format=duration*)
+    video_streams="${FAKE_FFPROBE_VIDEO_STREAMS:-1}"
+    audio_streams="${FAKE_FFPROBE_AUDIO_STREAMS:-2}"
+    [[ "${file##*/}" == .gsr-replay-audio.*.mp4 ]] && audio_streams="${FAKE_FFPROBE_TEMP_AUDIO_STREAMS:-1}"
+    [[ "${file##*/}" == "${FAKE_FFPROBE_NO_VIDEO_FILE:-__never__}" ]] && video_streams=0
+    for ((index = 0; index < video_streams; index += 1)); do
+      printf 'codec_type=video\n'
     done
-    ;;
-  *"-select_streams v"*)
-    streams="${FAKE_FFPROBE_VIDEO_STREAMS:-1}"
-    [[ "$(basename -- "$file")" == "${FAKE_FFPROBE_NO_VIDEO_FILE:-__never__}" ]] && streams=0
-    for ((index = 0; index < streams; index += 1)); do
-      printf '%s\n' "$index"
+    for ((index = 0; index < audio_streams; index += 1)); do
+      printf 'codec_type=audio\n'
     done
+    printf 'duration=%s\n' "${FAKE_FFPROBE_DURATION:-120.0}"
     ;;
   *)
     exit 1
@@ -663,6 +665,35 @@ test_config_values_are_data() {
   [[ ! -e "$marker" ]] || fail "loading the config executed its monitor value"
 }
 
+test_output_directory_discovery() {
+  local config="$XDG_CONFIG_HOME/gsr-replay/config" line
+  make_fake_systemctl
+  cat >"$FAKE_BIN/xdg-user-dir" <<'EOF'
+#!/usr/bin/env bash
+printf 'discovered\n' >>"$HOME/xdg-calls"
+printf '%s/Custom Videos\n' "$HOME"
+EOF
+  chmod +x "$FAKE_BIN/xdg-user-dir"
+  write_test_config screen 120 none false "$CASE_DIR/replays"
+  run_capture "$BASH_BIN" "$CLI" status-json
+  assert_eq 0 "$CAPTURE_STATUS" "configured status failed: $CAPTURE_OUTPUT"
+  [[ ! -e "$HOME/xdg-calls" ]] || fail "configured status unnecessarily discovered the video directory"
+
+  while IFS= read -r line; do
+    [[ "$line" == GSR_REPLAY_DIR=* ]] || printf '%s\n' "$line"
+  done <"$config" >"$config.without-output"
+  mv -- "$config.without-output" "$config"
+  run_capture "$BASH_BIN" "$CLI" status
+  assert_eq 0 "$CAPTURE_STATUS" "default output discovery failed: $CAPTURE_OUTPUT"
+  assert_contains "$CAPTURE_OUTPUT" "$HOME/Custom Videos/replay" "default output ignored the desktop video directory"
+  assert_eq discovered "$(<"$HOME/xdg-calls")" "default output was not discovered once"
+
+  printf 'GSR_REPLAY_DIR=\n' >>"$config"
+  run_capture "$BASH_BIN" "$CLI" status-json
+  assert_eq 1 "$CAPTURE_STATUS" "an explicitly empty output directory must remain invalid"
+  assert_contains "$CAPTURE_OUTPUT" 'cannot be empty' "empty output error is unclear"
+}
+
 test_oversized_ram_config() {
   local recorder_log="$CASE_DIR/recorder-arguments"
   local output_dir="$CASE_DIR/unsafe-ram-replays"
@@ -830,7 +861,8 @@ test_callback_notifications() {
   export FAKE_NOTIFY_LOG
   make_fake_notify_send
   FAKE_FFMPEG_LOG="$ffmpeg_log"
-  export FAKE_FFMPEG_LOG
+  FAKE_FFPROBE_LOG="$CASE_DIR/ffprobe.log"
+  export FAKE_FFMPEG_LOG FAKE_FFPROBE_LOG
   make_fake_ffmpeg
   mkdir -p "$installed_dir" || fail "could not create callback installation directory"
   cp "$CLI" "$installed_dir/gsr-replay"
@@ -851,6 +883,8 @@ test_callback_notifications() {
   assert_eq "$expected_notify" "$first_log" "callback save notification is incorrect"
   assert_contains "$(<"$ffmpeg_log")" $'<-map>\n<0:a:0>' "line out should keep only desktop audio"
   assert_not_contains "$(<"$ffmpeg_log")" 'amix=' "line out unexpectedly mixed microphone audio"
+  count_occurrences "$(<"$FAKE_FFPROBE_LOG")" '.mp4'
+  assert_eq 3 "$OCCURRENCES" "audio finalization should probe the source twice and the result once"
 
   run_capture "$installed_dir/gsr-replay-callback" "$CASE_DIR/missing.mp4"
   assert_eq 0 "$CAPTURE_STATUS" "callback should ignore a missing replay file"
@@ -872,6 +906,47 @@ test_callback_notifications() {
   [[ ! -e "$XDG_CONFIG_HOME/gsr-replay/save-request-time" ]] || fail "matching callback left its save request behind"
   assert_contains "$(<"$ffmpeg_log")" 'between(t,20,50) + between(t,70,110)' \
     "callback did not limit microphone audio to headphone intervals"
+}
+
+test_saved_media_validation() {
+  local output_dir="$CASE_DIR/replays" variant clip
+  mkdir -p "$output_dir"
+  write_test_config screen 120 default_output false "$output_dir"
+  FAKE_FFMPEG_LOG="$CASE_DIR/ffmpeg.log"
+  export FAKE_FFMPEG_LOG
+  make_fake_ffmpeg
+
+  for variant in probe-error missing-video extra-audio invalid-duration missing-final-audio; do
+    clip="$output_dir/$variant.mp4"
+    printf 'original clip\n' >"$clip"
+    FAKE_FFPROBE_FAIL_FILE=__never__
+    FAKE_FFPROBE_VIDEO_STREAMS=1
+    FAKE_FFPROBE_AUDIO_STREAMS=2
+    FAKE_FFPROBE_DURATION=120.0
+    FAKE_FFPROBE_TEMP_AUDIO_STREAMS=1
+    case "$variant" in
+      probe-error) FAKE_FFPROBE_FAIL_FILE="$variant.mp4" ;;
+      missing-video) FAKE_FFPROBE_VIDEO_STREAMS=0 ;;
+      extra-audio) FAKE_FFPROBE_AUDIO_STREAMS=3 ;;
+      invalid-duration) FAKE_FFPROBE_DURATION=N/A ;;
+      missing-final-audio) FAKE_FFPROBE_TEMP_AUDIO_STREAMS=0 ;;
+    esac
+    export FAKE_FFPROBE_FAIL_FILE FAKE_FFPROBE_VIDEO_STREAMS FAKE_FFPROBE_AUDIO_STREAMS
+    export FAKE_FFPROBE_DURATION FAKE_FFPROBE_TEMP_AUDIO_STREAMS
+    run_capture "$BASH_BIN" "$CLI" saved "$clip" replay
+    assert_eq 1 "$CAPTURE_STATUS" "callback accepted $variant media"
+    assert_eq 'original clip' "$(<"$clip")" "callback changed the original after $variant"
+  done
+
+  FAKE_FFPROBE_TEMP_AUDIO_STREAMS=1
+  for FAKE_FFPROBE_AUDIO_STREAMS in 0 1; do
+    clip="$output_dir/$FAKE_FFPROBE_AUDIO_STREAMS-audio.mp4"
+    printf 'valid clip\n' >"$clip"
+    : >"$FAKE_FFMPEG_LOG"
+    run_capture "$BASH_BIN" "$CLI" saved "$clip" replay
+    assert_eq 0 "$CAPTURE_STATUS" "callback rejected a clip with $FAKE_FFPROBE_AUDIO_STREAMS audio streams"
+    [[ ! -s "$FAKE_FFMPEG_LOG" ]] || fail "callback unnecessarily remuxed a clip with at most one audio stream"
+  done
 }
 
 test_delayed_replay_archiving() {
@@ -959,6 +1034,23 @@ test_archive_recovers_idempotently() {
   printf 'orphaned transaction\n' >"$orphan_pending"
   printf 'orphaned audio recovery\n' >"$orphan_audio_pending"
   write_test_config screen 120 none false "$staging" disk 12345 '' "$archive" 1800 A1B2-C3D4
+
+  # Recovery of a published clip must succeed even when another copy cannot be
+  # written. Other clips still need their normal copy and collision handling.
+  FAKE_ARCHIVE_RECOVERED_SOURCE="$source"
+  FAKE_ARCHIVE_REAL_CP="$(command -v cp)"
+  export FAKE_ARCHIVE_RECOVERED_SOURCE FAKE_ARCHIVE_REAL_CP
+  cat >"$FAKE_BIN/cp" <<'EOF'
+#!/usr/bin/env bash
+for argument in "$@"; do
+  if [[ "$argument" == "$FAKE_ARCHIVE_RECOVERED_SOURCE" ]]; then
+    printf 'A redundant copy of the recovered clip cannot be written.\n' >&2
+    exit 1
+  fi
+done
+exec "$FAKE_ARCHIVE_REAL_CP" "$@"
+EOF
+  chmod +x "$FAKE_BIN/cp"
 
   run_capture "$BASH_BIN" "$CLI" archive
   assert_eq 0 "$CAPTURE_STATUS" "archive recovery failed: $CAPTURE_OUTPUT"
@@ -1790,13 +1882,14 @@ run_test() {
 }
 
 printf 'TAP version 13\n'
-printf '1..38\n'
+printf '1..40\n'
 run_test 'help and version commands' test_help_and_version
 run_test 'recorder argument construction and audio omission' test_recorder_arguments
 run_test 'NVIDIA encoder failures fall back without restart loops' test_nvidia_encoder_fallbacks
 run_test 'recorder captures separate desktop and microphone tracks' test_recorder_captures_separate_audio_tracks
 run_test 'portal recording restores its portal session' test_portal_recorder_arguments
 run_test 'config values are parsed as data without shell evaluation' test_config_values_are_data
+run_test 'configured output skips discovery and missing output keeps desktop defaults' test_output_directory_discovery
 run_test 'unsafe oversized RAM buffers are rejected' test_oversized_ram_config
 run_test 'required output filesystem UUID is enforced' test_required_output_filesystem
 run_test 'output verification and doctor enforce required storage' test_output_verification_and_doctor
@@ -1804,6 +1897,7 @@ run_test 'missing configuration blocks every start path' test_missing_config_blo
 run_test 'saving an active replay signals the recorder' test_save_active
 run_test 'saving an inactive replay starts the service' test_save_inactive
 run_test 'callback notifications respect file and config state' test_callback_notifications
+run_test 'combined media probes reject invalid clips without replacing originals' test_saved_media_validation
 run_test 'due replay clips move safely to archive storage' test_delayed_replay_archiving
 run_test 'archive recovery is idempotent and removes stale partial files' test_archive_recovers_idempotently
 run_test 'archive validates staging storage and continues after per-file errors' test_archive_checks_source_and_continues

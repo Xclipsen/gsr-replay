@@ -4,6 +4,9 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- Reduce status polling overhead by skipping unused video-directory discovery and JSON-escaping subprocesses.
+- Read media stream counts and duration together to halve FFprobe launches during audio finalization while preserving source and output validation.
+- Recover already-published archive transactions without copying the entire clip again, retaining content, source-identity, and filesystem checks before removing staging data.
 - Show the Waybar replay state as a red or gray dot and place it after the tray expander when available.
 - Add setup-managed, configurable Hyprland hotkeys for toggling and saving replays.
 - Capture desktop and microphone audio separately and mix the microphone only during headphone-active replay sections.

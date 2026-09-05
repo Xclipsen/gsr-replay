@@ -115,7 +115,7 @@ set_defaults() {
   GSR_REPLAY_BITRATE="${GSR_REPLAY_BITRATE:-15000}"
   GSR_REPLAY_CODEC="${GSR_REPLAY_CODEC:-auto}"
   GSR_REPLAY_STORAGE="${GSR_REPLAY_STORAGE:-ram}"
-  GSR_REPLAY_DIR="${GSR_REPLAY_DIR:-${GSR_REPLAY_DEFAULT_DIR:-$(default_output_dir)}}"
+  GSR_REPLAY_DIR="${GSR_REPLAY_DIR:-${GSR_REPLAY_DEFAULT_DIR:-}}"
   GSR_REPLAY_REQUIRED_FS_UUID="${GSR_REPLAY_REQUIRED_FS_UUID:-${GSR_REPLAY_DEFAULT_FS_UUID:-}}"
   GSR_REPLAY_ARCHIVE_DIR="${GSR_REPLAY_ARCHIVE_DIR:-}"
   GSR_REPLAY_ARCHIVE_AFTER_SECONDS="${GSR_REPLAY_ARCHIVE_AFTER_SECONDS:-1800}"
@@ -133,6 +133,7 @@ set_defaults() {
 
 load_config() {
   set_defaults
+  local output_configured=false
   if [[ -f "$CONFIG_FILE" ]]; then
     local key value
     while IFS='=' read -r key value || [[ -n "$key" ]]; do
@@ -140,10 +141,15 @@ load_config() {
       case "$key" in
         GSR_REPLAY_MONITOR | GSR_REPLAY_RESOLUTION | GSR_REPLAY_FPS | GSR_REPLAY_SECONDS | GSR_REPLAY_AUDIO | GSR_REPLAY_BITRATE | GSR_REPLAY_CODEC | GSR_REPLAY_STORAGE | GSR_REPLAY_DIR | GSR_REPLAY_REQUIRED_FS_UUID | GSR_REPLAY_ARCHIVE_DIR | GSR_REPLAY_ARCHIVE_AFTER_SECONDS | GSR_REPLAY_ARCHIVE_REQUIRED_FS_UUID | GSR_REPLAY_NOTIFICATIONS | GSR_REPLAY_WAYBAR_CONFIG | GSR_REPLAY_WAYBAR_STYLE | GSR_REPLAY_WAYBAR_POSITION | GSR_REPLAY_WAYBAR_ENABLED | GSR_REPLAY_HYPRLAND_CONFIG | GSR_REPLAY_HYPRLAND_TOGGLE_BIND | GSR_REPLAY_HYPRLAND_SAVE_BIND | GSR_REPLAY_HYPRLAND_ENABLED)
           printf -v "$key" '%s' "$value"
+          [[ "$key" != GSR_REPLAY_DIR ]] || output_configured=true
           ;;
         *) die "Unknown setting in $CONFIG_FILE: $key" ;;
       esac
     done < "$CONFIG_FILE"
+  fi
+  # Discover the desktop's video directory only when no output was configured.
+  if [[ -z "$GSR_REPLAY_DIR" && "$output_configured" == false ]]; then
+    GSR_REPLAY_DIR="$(default_output_dir)"
   fi
   GSR_REPLAY_DIR="$(expand_home "$GSR_REPLAY_DIR")"
   GSR_REPLAY_ARCHIVE_DIR="$(expand_home "$GSR_REPLAY_ARCHIVE_DIR")"
@@ -387,6 +393,13 @@ archive_replay_file() {
   if [[ -z "${ARCHIVE_DESTINATION:-}" ]]; then
     select_archive_destination "$source"
     write_archive_pending "$pending" "$signature" "$(basename -- "$ARCHIVE_DESTINATION")" || return 1
+  fi
+
+  # A recovered transaction may already have published its destination. Finish
+  # verification and cleanup without writing another full-size temporary copy.
+  if [[ -f "$ARCHIVE_DESTINATION" && ! -L "$ARCHIVE_DESTINATION" ]] && cmp -s -- "$source" "$ARCHIVE_DESTINATION"; then
+    remove_archived_source "$source" "$ARCHIVE_DESTINATION" "$signature" "$pending"
+    return
   fi
 
   temp="$(mktemp "$GSR_REPLAY_ARCHIVE_DIR/.gsr-replay.XXXXXX.part")" || return 1
@@ -710,7 +723,7 @@ run_recorder() {
 }
 
 replay_saved() {
-  local file="${1:-}" type="${2:-replay}" audio_streams video_streams pending
+  local file="${1:-}" type="${2:-replay}" pending
   [[ -n "$file" && -f "$file" ]] || return 0
   require_config
   load_config
@@ -725,19 +738,15 @@ replay_saved() {
     ensure_safe_lock_file "$MEDIA_LOCK_FILE"
     exec 9>>"$MEDIA_LOCK_FILE"
     flock 9
-    video_streams="$(media_stream_count "$file" v)" || {
+    probe_media "$file" || {
       notify "Replay validation failed" "The clip remains in $file and will be retried before archiving." critical 10000
       return 1
     }
-    if ((video_streams < 1)); then
+    if ((MEDIA_VIDEO_STREAMS < 1)); then
       notify "Replay validation failed" "The clip remains in $file and will be retried before archiving." critical 10000
       return 1
     fi
-    audio_streams="$(media_stream_count "$file" a)" || {
-      notify "Replay validation failed" "The clip remains in $file and will be retried before archiving." critical 10000
-      return 1
-    }
-    if ((audio_streams > 1)); then
+    if ((MEDIA_AUDIO_STREAMS > 1)); then
       ensure_audio_pending "$file" true || return 1
       if ! finalize_replay_audio "$file" "$AUDIO_PENDING_PATH"; then
         notify "Replay audio processing failed" "The original clip remains in $file and will be retried before archiving." critical 10000
@@ -757,23 +766,23 @@ replay_saved() {
 
 finalize_replay_audio() {
   local file="$1" pending="$2" temp duration whole_duration rounded_duration fraction end_time start_time
-  local microphone_intervals filter source_signature audio_streams video_streams
+  local microphone_intervals filter source_signature
   require_command ffmpeg
   require_command ffprobe
   require_command sync
   [[ -f "$file" && ! -L "$file" && -f "$pending" && ! -L "$pending" ]] || return 1
   filesystem_available "$file" "$GSR_REPLAY_REQUIRED_FS_UUID" || return 1
-  audio_streams="$(media_stream_count "$file" a)" || return 1
-  if ((audio_streams <= 1)); then
+  probe_media "$file" || return 1
+  if ((MEDIA_AUDIO_STREAMS <= 1)); then
     complete_audio_pending "$pending"
     return
   fi
-  ((audio_streams == 2)) || return 1
+  ((MEDIA_AUDIO_STREAMS == 2)) || return 1
+  duration="$MEDIA_DURATION"
 
   source_signature="$(file_signature "$file")" || return 1
   read_audio_pending "$pending" "$source_signature" || return 1
   end_time="$(save_record_timestamp "$AUDIO_PENDING_RECORD")" || return 1
-  duration="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 -- "$file")" || return 1
   [[ "$duration" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
   whole_duration="${duration%%.*}"
   rounded_duration="$((10#$whole_duration))"
@@ -798,15 +807,11 @@ finalize_replay_audio() {
     rm -f -- "$temp"
     return 1
   fi
-  video_streams="$(media_stream_count "$temp" v)" || {
+  probe_media "$temp" || {
     rm -f -- "$temp"
     return 1
   }
-  audio_streams="$(media_stream_count "$temp" a)" || {
-    rm -f -- "$temp"
-    return 1
-  }
-  if ((video_streams < 1 || audio_streams != 1)) || [[ ! -s "$temp" ]] ||
+  if ((MEDIA_VIDEO_STREAMS < 1 || MEDIA_AUDIO_STREAMS != 1)) || [[ ! -s "$temp" ]] ||
      [[ "$(file_signature "$file" 2>/dev/null || true)" != "$source_signature" ]] ||
      ! chmod --reference="$file" -- "$temp" || ! touch -r "$file" -- "$temp" ||
      ! sync -- "$temp" ||
@@ -821,16 +826,15 @@ finalize_replay_audio() {
 }
 
 prepare_replay_for_archive() {
-  local file="$1" pending audio_streams video_streams
+  local file="$1" pending
   pending="$(audio_pending_path "$file")"
   filesystem_available "$file" "$GSR_REPLAY_REQUIRED_FS_UUID" || return 1
   if [[ -L "$pending" || ( -e "$pending" && ! -f "$pending" ) ]]; then
     return 1
   fi
-  video_streams="$(media_stream_count "$file" v)" || return 1
-  ((video_streams >= 1)) || return 1
-  audio_streams="$(media_stream_count "$file" a)" || return 1
-  if ((audio_streams <= 1)); then
+  probe_media "$file" || return 1
+  ((MEDIA_VIDEO_STREAMS >= 1)) || return 1
+  if ((MEDIA_AUDIO_STREAMS <= 1)); then
     [[ ! -f "$pending" ]] || complete_audio_pending "$pending"
     return
   fi
@@ -838,13 +842,22 @@ prepare_replay_for_archive() {
   finalize_replay_audio "$file" "$AUDIO_PENDING_PATH"
 }
 
-media_stream_count() {
-  local file="$1" selector="$2" output line count=0
-  output="$(ffprobe -v error -select_streams "$selector" -show_entries stream=index -of csv=p=0 -- "$file")" || return 1
-  while IFS= read -r line; do
-    [[ -n "$line" ]] && ((count += 1))
+probe_media() {
+  local file="$1" output key value
+  MEDIA_VIDEO_STREAMS=0
+  MEDIA_AUDIO_STREAMS=0
+  MEDIA_DURATION=""
+  # Read all metadata in one process; callers still recheck replaced files.
+  output="$(ffprobe -v error -show_entries stream=codec_type:format=duration \
+    -of default=noprint_wrappers=1 -- "$file")" || return 1
+  while IFS='=' read -r key value; do
+    case "$key=$value" in
+      codec_type=video) ((MEDIA_VIDEO_STREAMS += 1)) ;;
+      codec_type=audio) ((MEDIA_AUDIO_STREAMS += 1)) ;;
+      duration=*) MEDIA_DURATION="$value" ;;
+    esac
   done <<< "$output"
-  printf '%s\n' "$count"
+  return 0
 }
 
 audio_pending_path() {
@@ -2716,8 +2729,11 @@ status_json() {
     class="inactive"
     tooltip="Replay buffer is off"$'\n'"Right-click: Start"
   fi
-  printf '{"text":"%s","alt":"%s","tooltip":"%s","class":"%s"}\n' \
-    "$(json_escape "$text")" "$(json_escape "$state")" "$(json_escape "$tooltip")" "$(json_escape "$class")"
+  printf '{"text":"'
+  json_escape "$text"
+  printf '","alt":"%s","tooltip":"' "$state"
+  json_escape "$tooltip"
+  printf '","class":"%s"}\n' "$class"
 }
 
 json_escape() {
