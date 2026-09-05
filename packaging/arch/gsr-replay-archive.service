@@ -5,4 +5,5 @@ Documentation=https://github.com/Xclipsen/gsr-replay
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/gsr-replay archive
+TimeoutStartSec=infinity
 UMask=0077

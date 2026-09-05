@@ -106,8 +106,16 @@ EOF
   chmod +x "$FAKE_BIN/omarchy-restart-waybar" || fail "could not create fake Waybar restart helper"
   make_fake_pactl
   export HOME XDG_CONFIG_HOME PATH
-  unset FAKE_GSR_LOG FAKE_NOTIFY_LOG FAKE_SYSTEMCTL_LOG FAKE_SYSTEMCTL_STATE FAKE_SYSTEMCTL_FRAGMENT FAKE_SYSTEMCTL_DROPINS
-  unset FAKE_PACTL_DEFAULT_SINK FAKE_PACTL_PORT FAKE_FFMPEG_LOG
+  unset FAKE_GSR_LOG FAKE_GSR_VENDOR FAKE_GSR_CODECS FAKE_GSR_INFO_STATUS
+  unset FAKE_ENCODER_LOG FAKE_FFMPEG_NVENC_STATUS FAKE_FFMPEG_VULKAN_STATUS
+  unset FAKE_NOTIFY_LOG FAKE_SYSTEMCTL_LOG FAKE_SYSTEMCTL_STATE FAKE_SYSTEMCTL_FRAGMENT FAKE_SYSTEMCTL_DROPINS FAKE_SYSTEMCTL_KILL_FAIL
+  unset FAKE_AUDIO_MONITOR_FRAGMENT FAKE_AUDIO_MONITOR_DROPINS FAKE_ARCHIVE_SERVICE_FRAGMENT FAKE_ARCHIVE_SERVICE_DROPINS
+  unset FAKE_ARCHIVE_TIMER_FRAGMENT FAKE_ARCHIVE_TIMER_DROPINS
+  unset FAKE_PACTL_DEFAULT_SINK FAKE_PACTL_PORT FAKE_FFMPEG_LOG FAKE_FFMPEG_FAIL FAKE_FFPROBE_AUDIO_STREAMS
+  unset FAKE_FFPROBE_VIDEO_STREAMS FAKE_FFPROBE_NO_VIDEO_FILE
+  unset FAKE_FFPROBE_LOG FAKE_FFPROBE_FAIL_FILE FAKE_FFPROBE_DURATION FAKE_FFPROBE_TEMP_AUDIO_STREAMS
+  unset FAKE_FINDMNT_UUID FAKE_FINDMNT_SOURCE_PREFIX FAKE_FINDMNT_SOURCE_UUID FAKE_FINDMNT_ARCHIVE_PREFIX FAKE_FINDMNT_ARCHIVE_UUID
+  unset FAKE_ARCHIVE_RECOVERED_SOURCE FAKE_ARCHIVE_REAL_CP
   unset FAKE_HYPR_STATE FAKE_HYPR_ERRORS_BEFORE FAKE_HYPR_ERRORS_AFTER HYPRLAND_INSTANCE_SIGNATURE
 }
 
@@ -136,6 +144,33 @@ if [[ "$*" == "--user show gsr-replay.service --property=DropInPaths --value" ]]
   printf '%s\n' "${FAKE_SYSTEMCTL_DROPINS:-}"
   exit 0
 fi
+if [[ "$*" == "--user show gsr-replay-audio-monitor.service --property=FragmentPath --value" ]]; then
+  printf '%s\n' "${FAKE_AUDIO_MONITOR_FRAGMENT:-$XDG_CONFIG_HOME/systemd/user/gsr-replay-audio-monitor.service}"
+  exit 0
+fi
+if [[ "$*" == "--user show gsr-replay-audio-monitor.service --property=DropInPaths --value" ]]; then
+  printf '%s\n' "${FAKE_AUDIO_MONITOR_DROPINS:-}"
+  exit 0
+fi
+if [[ "$*" == "--user show gsr-replay-archive.service --property=FragmentPath --value" ]]; then
+  printf '%s\n' "${FAKE_ARCHIVE_SERVICE_FRAGMENT:-$XDG_CONFIG_HOME/systemd/user/gsr-replay-archive.service}"
+  exit 0
+fi
+if [[ "$*" == "--user show gsr-replay-archive.service --property=DropInPaths --value" ]]; then
+  printf '%s\n' "${FAKE_ARCHIVE_SERVICE_DROPINS:-}"
+  exit 0
+fi
+if [[ "$*" == "--user show gsr-replay-archive.timer --property=FragmentPath --value" ]]; then
+  printf '%s\n' "${FAKE_ARCHIVE_TIMER_FRAGMENT:-$XDG_CONFIG_HOME/systemd/user/gsr-replay-archive.timer}"
+  exit 0
+fi
+if [[ "$*" == "--user show gsr-replay-archive.timer --property=DropInPaths --value" ]]; then
+  printf '%s\n' "${FAKE_ARCHIVE_TIMER_DROPINS:-}"
+  exit 0
+fi
+if [[ "$*" == "--user kill --kill-whom=main --signal=SIGUSR1 gsr-replay.service" && "${FAKE_SYSTEMCTL_KILL_FAIL:-false}" == "true" ]]; then
+  exit 1
+fi
 exit 0
 EOF
   chmod +x "$FAKE_BIN/systemctl" || fail "could not create fake systemctl"
@@ -153,7 +188,23 @@ EOF
 make_fake_findmnt() {
   cat >"$FAKE_BIN/findmnt" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "${FAKE_FINDMNT_UUID:-}"
+set -u
+target=""
+previous=""
+for argument in "$@"; do
+  if [[ "$previous" == "--target" ]]; then
+    target="$argument"
+    break
+  fi
+  previous="$argument"
+done
+if [[ -n "${FAKE_FINDMNT_SOURCE_PREFIX:-}" && "$target" == "$FAKE_FINDMNT_SOURCE_PREFIX"* ]]; then
+  printf '%s\n' "${FAKE_FINDMNT_SOURCE_UUID:-}"
+elif [[ -n "${FAKE_FINDMNT_ARCHIVE_PREFIX:-}" && "$target" == "$FAKE_FINDMNT_ARCHIVE_PREFIX"* ]]; then
+  printf '%s\n' "${FAKE_FINDMNT_ARCHIVE_UUID:-}"
+else
+  printf '%s\n' "${FAKE_FINDMNT_UUID:-}"
+fi
 EOF
   chmod +x "$FAKE_BIN/findmnt" || fail "could not create fake findmnt"
 }
@@ -162,9 +213,30 @@ make_fake_recorder() {
   cat >"$FAKE_BIN/gpu-screen-recorder" <<'EOF'
 #!/usr/bin/env bash
 set -u
+if [[ "$*" == "--info" ]]; then
+  printf '%s\n' 'section=gpu_info'
+  printf 'vendor|%s\n' "${FAKE_GSR_VENDOR:-amd}"
+  printf '%s\n' 'section=video_codecs'
+  printf '%s\n' "${FAKE_GSR_CODECS:-h264}"
+  exit "${FAKE_GSR_INFO_STATUS:-0}"
+fi
 printf '<%s>\n' "$@" >"${FAKE_GSR_LOG:?}"
 EOF
   chmod +x "$FAKE_BIN/gpu-screen-recorder" || fail "could not create fake recorder"
+}
+
+make_fake_encoder_ffmpeg() {
+  cat >"$FAKE_BIN/ffmpeg" <<'EOF'
+#!/usr/bin/env bash
+set -u
+printf '<%s>\n' "$@" >>"${FAKE_ENCODER_LOG:?}"
+case "$*" in
+  *h264_nvenc*) exit "${FAKE_FFMPEG_NVENC_STATUS:-0}" ;;
+  *h264_vulkan*) exit "${FAKE_FFMPEG_VULKAN_STATUS:-0}" ;;
+  *) exit 2 ;;
+esac
+EOF
+  chmod +x "$FAKE_BIN/ffmpeg" || fail "could not create fake encoder ffmpeg"
 }
 
 make_fake_pactl() {
@@ -192,7 +264,8 @@ make_fake_ffmpeg() {
   cat >"$FAKE_BIN/ffmpeg" <<'EOF'
 #!/usr/bin/env bash
 set -u
-printf '<%s>\n' "$@" >"${FAKE_FFMPEG_LOG:?}"
+printf '<%s>\n' "$@" >>"${FAKE_FFMPEG_LOG:?}"
+[[ "${FAKE_FFMPEG_FAIL:-false}" == "false" ]] || exit 1
 input=""
 previous=""
 for argument in "$@"; do
@@ -205,9 +278,36 @@ output="${!#}"
 cp -- "$input" "$output"
 EOF
   chmod +x "$FAKE_BIN/ffmpeg" || fail "could not create fake ffmpeg"
+  make_fake_ffprobe
+}
+
+make_fake_ffprobe() {
   cat >"$FAKE_BIN/ffprobe" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "${FAKE_FFPROBE_DURATION:-120.0}"
+set -u
+file="${!#}"
+[[ -z "${FAKE_FFPROBE_LOG:-}" ]] || printf '%s\n' "$file" >>"$FAKE_FFPROBE_LOG"
+if [[ "${file##*/}" == "${FAKE_FFPROBE_FAIL_FILE:-__never__}" ]]; then
+  exit 1
+fi
+case "$*" in
+  *stream=codec_type:format=duration*)
+    video_streams="${FAKE_FFPROBE_VIDEO_STREAMS:-1}"
+    audio_streams="${FAKE_FFPROBE_AUDIO_STREAMS:-2}"
+    [[ "${file##*/}" == .gsr-replay-audio.*.mp4 ]] && audio_streams="${FAKE_FFPROBE_TEMP_AUDIO_STREAMS:-1}"
+    [[ "${file##*/}" == "${FAKE_FFPROBE_NO_VIDEO_FILE:-__never__}" ]] && video_streams=0
+    for ((index = 0; index < video_streams; index += 1)); do
+      printf 'codec_type=video\n'
+    done
+    for ((index = 0; index < audio_streams; index += 1)); do
+      printf 'codec_type=audio\n'
+    done
+    printf 'duration=%s\n' "${FAKE_FFPROBE_DURATION:-120.0}"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
 EOF
   chmod +x "$FAKE_BIN/ffprobe" || fail "could not create fake ffprobe"
 }
@@ -216,6 +316,9 @@ install_expected_service() {
   local service_path="$XDG_CONFIG_HOME/systemd/user/gsr-replay.service"
   mkdir -p "$(dirname -- "$service_path")"
   cp "$ROOT_DIR/systemd/gsr-replay.service" "$service_path"
+  cp "$ROOT_DIR/systemd/gsr-replay-audio-monitor.service" "$(dirname -- "$service_path")/gsr-replay-audio-monitor.service"
+  cp "$ROOT_DIR/systemd/gsr-replay-archive.service" "$(dirname -- "$service_path")/gsr-replay-archive.service"
+  cp "$ROOT_DIR/systemd/gsr-replay-archive.timer" "$(dirname -- "$service_path")/gsr-replay-archive.timer"
   FAKE_SYSTEMCTL_FRAGMENT="$service_path"
   export FAKE_SYSTEMCTL_FRAGMENT
 }
@@ -260,6 +363,7 @@ write_test_config() {
   local archive_dir="${9:-}"
   local archive_after="${10:-1800}"
   local archive_uuid="${11:-}"
+  local codec="${12:-h264}"
   local config_dir="$XDG_CONFIG_HOME/gsr-replay"
 
   mkdir -p "$config_dir" || fail "could not create configuration directory"
@@ -270,7 +374,7 @@ write_test_config() {
     printf 'GSR_REPLAY_SECONDS=%s\n' "$seconds"
     printf 'GSR_REPLAY_AUDIO=%s\n' "$audio"
     printf 'GSR_REPLAY_BITRATE=%s\n' "$bitrate"
-    printf 'GSR_REPLAY_CODEC=%s\n' 'h264'
+    printf 'GSR_REPLAY_CODEC=%s\n' "$codec"
     printf 'GSR_REPLAY_STORAGE=%s\n' "$storage"
     printf 'GSR_REPLAY_DIR=%s\n' "$output_dir"
     printf 'GSR_REPLAY_REQUIRED_FS_UUID=%s\n' "$required_uuid"
@@ -421,6 +525,74 @@ test_recorder_arguments() {
   assert_eq "$expected" "$actual" "recorder should omit -a when audio is disabled"
 }
 
+test_nvidia_encoder_fallbacks() {
+  local recorder_log="$CASE_DIR/recorder-arguments"
+  local encoder_log="$CASE_DIR/encoder-probes"
+  local output_dir="$CASE_DIR/replays"
+  local callback_path="$HOME/.local/bin/gsr-replay-callback"
+  local actual
+
+  FAKE_GSR_LOG="$recorder_log"
+  FAKE_ENCODER_LOG="$encoder_log"
+  FAKE_GSR_VENDOR=nvidia
+  FAKE_GSR_CODECS=$'h264\nh264_software\nh264_vulkan'
+  export FAKE_GSR_LOG FAKE_ENCODER_LOG FAKE_GSR_VENDOR FAKE_GSR_CODECS
+  make_fake_recorder
+  make_fake_encoder_ffmpeg
+  mkdir -p "$(dirname -- "$callback_path")" || fail "could not create callback directory"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$callback_path"
+  chmod +x "$callback_path"
+  write_test_config DP-1 75 none false "$output_dir" disk 12345 '' '' 1800 '' auto
+
+  : >"$encoder_log"
+  FAKE_FFMPEG_NVENC_STATUS=0
+  FAKE_FFMPEG_VULKAN_STATUS=1
+  export FAKE_FFMPEG_NVENC_STATUS FAKE_FFMPEG_VULKAN_STATUS
+  run_capture "$BASH_BIN" "$CLI" run
+  assert_eq 0 "$CAPTURE_STATUS" "working NVENC should start normally: $CAPTURE_OUTPUT"
+  actual="$(<"$recorder_log")"
+  assert_contains "$actual" $'<-k>\n<auto>' "working NVENC changed the configured codec"
+  assert_not_contains "$actual" '<-encoder>' "working NVENC unexpectedly selected CPU encoding"
+  assert_not_contains "$CAPTURE_OUTPUT" 'Warning:' "working NVENC emitted a fallback warning"
+
+  rm -f -- "$recorder_log"
+  : >"$encoder_log"
+  FAKE_FFMPEG_NVENC_STATUS=1
+  FAKE_FFMPEG_VULKAN_STATUS=0
+  export FAKE_FFMPEG_NVENC_STATUS FAKE_FFMPEG_VULKAN_STATUS
+  run_capture "$BASH_BIN" "$CLI" run
+  assert_eq 0 "$CAPTURE_STATUS" "Vulkan fallback should start after NVENC failure: $CAPTURE_OUTPUT"
+  actual="$(<"$recorder_log")"
+  assert_contains "$actual" $'<-k>\n<h264_vulkan>' "NVENC failure did not select the H.264 Vulkan codec"
+  assert_not_contains "$actual" '<-encoder>' "Vulkan fallback unexpectedly selected CPU encoding"
+  assert_contains "$CAPTURE_OUTPUT" 'using H.264 Vulkan GPU encoding' "Vulkan fallback was not reported"
+  assert_contains "$(<"$encoder_log")" 'h264_nvenc' "NVENC was not probed before falling back"
+  assert_contains "$(<"$encoder_log")" 'h264_vulkan' "Vulkan was not validated before selection"
+
+  rm -f -- "$recorder_log"
+  : >"$encoder_log"
+  FAKE_FFMPEG_NVENC_STATUS=1
+  FAKE_FFMPEG_VULKAN_STATUS=1
+  export FAKE_FFMPEG_NVENC_STATUS FAKE_FFMPEG_VULKAN_STATUS
+  run_capture "$BASH_BIN" "$CLI" run
+  assert_eq 0 "$CAPTURE_STATUS" "CPU fallback should start when both GPU paths fail: $CAPTURE_OUTPUT"
+  actual="$(<"$recorder_log")"
+  assert_contains "$actual" $'<-k>\n<h264>\n<-encoder>\n<cpu>' "GPU failures did not select H.264 CPU encoding"
+  assert_contains "$CAPTURE_OUTPUT" 'using CPU encoding' "CPU fallback was not reported"
+
+  rm -f -- "$recorder_log"
+  FAKE_GSR_CODECS=h264
+  export FAKE_GSR_CODECS
+  run_capture "$BASH_BIN" "$CLI" run
+  assert_eq 78 "$CAPTURE_STATUS" "missing encoder fallbacks should use the permanent failure exit status"
+  assert_contains "$CAPTURE_OUTPUT" 'No usable H.264 encoder is available' "permanent encoder failure is unclear"
+  [[ ! -e "$recorder_log" ]] || fail "recorder started without a usable encoder"
+  assert_file_contains "$ROOT_DIR/systemd/gsr-replay.service" 'RestartPreventExitStatus=78' \
+    "source service would restart after a permanent encoder failure"
+  assert_file_contains "$ROOT_DIR/packaging/arch/gsr-replay.service" 'RestartPreventExitStatus=78' \
+    "packaged service would restart after a permanent encoder failure"
+}
+
 test_recorder_captures_separate_audio_tracks() {
   local recorder_log="$CASE_DIR/recorder-arguments"
   local output_dir="$CASE_DIR/replays"
@@ -491,6 +663,35 @@ test_config_values_are_data() {
   assert_eq 0 "$CAPTURE_STATUS" "data-like config value was rejected: $CAPTURE_OUTPUT"
   assert_contains "$CAPTURE_OUTPUT" "Display:       $monitor" "monitor value was not parsed literally"
   [[ ! -e "$marker" ]] || fail "loading the config executed its monitor value"
+}
+
+test_output_directory_discovery() {
+  local config="$XDG_CONFIG_HOME/gsr-replay/config" line
+  make_fake_systemctl
+  cat >"$FAKE_BIN/xdg-user-dir" <<'EOF'
+#!/usr/bin/env bash
+printf 'discovered\n' >>"$HOME/xdg-calls"
+printf '%s/Custom Videos\n' "$HOME"
+EOF
+  chmod +x "$FAKE_BIN/xdg-user-dir"
+  write_test_config screen 120 none false "$CASE_DIR/replays"
+  run_capture "$BASH_BIN" "$CLI" status-json
+  assert_eq 0 "$CAPTURE_STATUS" "configured status failed: $CAPTURE_OUTPUT"
+  [[ ! -e "$HOME/xdg-calls" ]] || fail "configured status unnecessarily discovered the video directory"
+
+  while IFS= read -r line; do
+    [[ "$line" == GSR_REPLAY_DIR=* ]] || printf '%s\n' "$line"
+  done <"$config" >"$config.without-output"
+  mv -- "$config.without-output" "$config"
+  run_capture "$BASH_BIN" "$CLI" status
+  assert_eq 0 "$CAPTURE_STATUS" "default output discovery failed: $CAPTURE_OUTPUT"
+  assert_contains "$CAPTURE_OUTPUT" "$HOME/Custom Videos/replay" "default output ignored the desktop video directory"
+  assert_eq discovered "$(<"$HOME/xdg-calls")" "default output was not discovered once"
+
+  printf 'GSR_REPLAY_DIR=\n' >>"$config"
+  run_capture "$BASH_BIN" "$CLI" status-json
+  assert_eq 1 "$CAPTURE_STATUS" "an explicitly empty output directory must remain invalid"
+  assert_contains "$CAPTURE_OUTPUT" 'cannot be empty' "empty output error is unclear"
 }
 
 test_oversized_ram_config() {
@@ -608,7 +809,7 @@ test_save_active() {
   run_capture "$BASH_BIN" "$CLI" save
   assert_eq 0 "$CAPTURE_STATUS" "saving an active replay failed: $CAPTURE_OUTPUT"
   assert_eq 'Replay save requested.' "$CAPTURE_OUTPUT" "active save confirmation is incorrect"
-  assert_eq $'--user show gsr-replay.service --property=FragmentPath --value\n--user show gsr-replay.service --property=DropInPaths --value\n--user is-active --quiet gsr-replay.service\n--user kill --kill-whom=main --signal=SIGUSR1 gsr-replay.service' \
+  assert_eq $'--user show gsr-replay.service --property=FragmentPath --value\n--user show gsr-replay.service --property=DropInPaths --value\n--user show gsr-replay-audio-monitor.service --property=FragmentPath --value\n--user show gsr-replay-audio-monitor.service --property=DropInPaths --value\n--user is-active --quiet gsr-replay.service\n--user kill --kill-whom=main --signal=SIGUSR1 gsr-replay.service' \
     "$(<"$systemctl_log")" "active save sent incorrect systemctl commands"
   assert_eq '' "$(<"$notify_log")" "active save should wait for the completion notification"
 }
@@ -633,7 +834,7 @@ test_save_inactive() {
   assert_eq 1 "$CAPTURE_STATUS" "saving an inactive replay should fail after starting it"
   assert_eq 'Error: Replay buffer was not running. It has been started; try again in a moment.' \
     "$CAPTURE_OUTPUT" "inactive save error is incorrect"
-  assert_eq $'--user show gsr-replay.service --property=FragmentPath --value\n--user show gsr-replay.service --property=DropInPaths --value\n--user is-active --quiet gsr-replay.service\n--user start gsr-replay.service' \
+  assert_eq $'--user show gsr-replay.service --property=FragmentPath --value\n--user show gsr-replay.service --property=DropInPaths --value\n--user show gsr-replay-audio-monitor.service --property=FragmentPath --value\n--user show gsr-replay-audio-monitor.service --property=DropInPaths --value\n--user is-active --quiet gsr-replay.service\n--user start gsr-replay.service' \
     "$(<"$systemctl_log")" "inactive save sent incorrect systemctl commands"
   expected_notify="$(printf '<%s>\n' \
     '--app-name=GSR Replay' \
@@ -647,24 +848,27 @@ test_save_inactive() {
 test_callback_notifications() {
   local notify_log="$CASE_DIR/notify.log"
   local installed_dir="$HOME/.local/bin"
-  local replay_file="$CASE_DIR/a replay clip.mp4"
-  local second_file="$CASE_DIR/notifications-disabled.mp4"
-  local expected_notify first_log ffmpeg_log="$CASE_DIR/ffmpeg.log"
+  local output_dir="$CASE_DIR/replays"
+  local replay_file="$output_dir/a replay clip.mp4"
+  local second_file="$output_dir/notifications-disabled.mp4"
+  local expected_notify first_log ffmpeg_log="$CASE_DIR/ffmpeg.log" end_time
 
+  mkdir -p "$output_dir"
   : >"$notify_log"
-  : >"$replay_file"
-  : >"$second_file"
+  printf 'saved replay\n' >"$replay_file"
+  printf 'saved replay\n' >"$second_file"
   FAKE_NOTIFY_LOG="$notify_log"
   export FAKE_NOTIFY_LOG
   make_fake_notify_send
   FAKE_FFMPEG_LOG="$ffmpeg_log"
-  export FAKE_FFMPEG_LOG
+  FAKE_FFPROBE_LOG="$CASE_DIR/ffprobe.log"
+  export FAKE_FFMPEG_LOG FAKE_FFPROBE_LOG
   make_fake_ffmpeg
   mkdir -p "$installed_dir" || fail "could not create callback installation directory"
   cp "$CLI" "$installed_dir/gsr-replay"
   cp "$CALLBACK" "$installed_dir/gsr-replay-callback"
   chmod +x "$installed_dir/gsr-replay" "$installed_dir/gsr-replay-callback"
-  write_test_config screen 120 default_output true "$CASE_DIR/replays"
+  write_test_config screen 120 default_output true "$output_dir"
 
   run_capture "$installed_dir/gsr-replay-callback" "$replay_file"
   assert_eq 0 "$CAPTURE_STATUS" "callback failed for a saved replay: $CAPTURE_OUTPUT"
@@ -679,24 +883,70 @@ test_callback_notifications() {
   assert_eq "$expected_notify" "$first_log" "callback save notification is incorrect"
   assert_contains "$(<"$ffmpeg_log")" $'<-map>\n<0:a:0>' "line out should keep only desktop audio"
   assert_not_contains "$(<"$ffmpeg_log")" 'amix=' "line out unexpectedly mixed microphone audio"
+  count_occurrences "$(<"$FAKE_FFPROBE_LOG")" '.mp4'
+  assert_eq 3 "$OCCURRENCES" "audio finalization should probe the source twice and the result once"
 
   run_capture "$installed_dir/gsr-replay-callback" "$CASE_DIR/missing.mp4"
   assert_eq 0 "$CAPTURE_STATUS" "callback should ignore a missing replay file"
   assert_eq "$first_log" "$(<"$notify_log")" "callback notified for a missing replay file"
 
-  write_test_config screen 120 default_output false "$CASE_DIR/replays"
-  printf '%s\n' \
-    '800|desktop-only' \
-    '900|desktop-with-microphone' \
-    '930|desktop-only' \
-    '950|desktop-with-microphone' \
-    '990|desktop-only' >"$XDG_CONFIG_HOME/gsr-replay/audio-state.log"
-  printf '1000\n' >"$XDG_CONFIG_HOME/gsr-replay/save-request-time"
+  write_test_config screen 120 default_output false "$output_dir"
+  end_time="$(stat -c %W -- "$second_file")"
+  [[ "$end_time" =~ ^[0-9]+$ && "$end_time" -gt 0 ]] || end_time="$(stat -c %Y -- "$second_file")"
+  printf '%s|%s\n' \
+    "$((end_time - 200))" desktop-only \
+    "$((end_time - 100))" desktop-with-microphone \
+    "$((end_time - 70))" desktop-only \
+    "$((end_time - 50))" desktop-with-microphone \
+    "$((end_time - 10))" desktop-only >"$XDG_CONFIG_HOME/gsr-replay/audio-state.log"
+  printf '%s|test\n' "$end_time" >"$XDG_CONFIG_HOME/gsr-replay/save-request-time"
   run_capture "$installed_dir/gsr-replay-callback" "$second_file"
   assert_eq 0 "$CAPTURE_STATUS" "callback failed when notifications were disabled"
   assert_eq "$first_log" "$(<"$notify_log")" "callback ignored the notifications setting"
+  [[ ! -e "$XDG_CONFIG_HOME/gsr-replay/save-request-time" ]] || fail "matching callback left its save request behind"
   assert_contains "$(<"$ffmpeg_log")" 'between(t,20,50) + between(t,70,110)' \
     "callback did not limit microphone audio to headphone intervals"
+}
+
+test_saved_media_validation() {
+  local output_dir="$CASE_DIR/replays" variant clip
+  mkdir -p "$output_dir"
+  write_test_config screen 120 default_output false "$output_dir"
+  FAKE_FFMPEG_LOG="$CASE_DIR/ffmpeg.log"
+  export FAKE_FFMPEG_LOG
+  make_fake_ffmpeg
+
+  for variant in probe-error missing-video extra-audio invalid-duration missing-final-audio; do
+    clip="$output_dir/$variant.mp4"
+    printf 'original clip\n' >"$clip"
+    FAKE_FFPROBE_FAIL_FILE=__never__
+    FAKE_FFPROBE_VIDEO_STREAMS=1
+    FAKE_FFPROBE_AUDIO_STREAMS=2
+    FAKE_FFPROBE_DURATION=120.0
+    FAKE_FFPROBE_TEMP_AUDIO_STREAMS=1
+    case "$variant" in
+      probe-error) FAKE_FFPROBE_FAIL_FILE="$variant.mp4" ;;
+      missing-video) FAKE_FFPROBE_VIDEO_STREAMS=0 ;;
+      extra-audio) FAKE_FFPROBE_AUDIO_STREAMS=3 ;;
+      invalid-duration) FAKE_FFPROBE_DURATION=N/A ;;
+      missing-final-audio) FAKE_FFPROBE_TEMP_AUDIO_STREAMS=0 ;;
+    esac
+    export FAKE_FFPROBE_FAIL_FILE FAKE_FFPROBE_VIDEO_STREAMS FAKE_FFPROBE_AUDIO_STREAMS
+    export FAKE_FFPROBE_DURATION FAKE_FFPROBE_TEMP_AUDIO_STREAMS
+    run_capture "$BASH_BIN" "$CLI" saved "$clip" replay
+    assert_eq 1 "$CAPTURE_STATUS" "callback accepted $variant media"
+    assert_eq 'original clip' "$(<"$clip")" "callback changed the original after $variant"
+  done
+
+  FAKE_FFPROBE_TEMP_AUDIO_STREAMS=1
+  for FAKE_FFPROBE_AUDIO_STREAMS in 0 1; do
+    clip="$output_dir/$FAKE_FFPROBE_AUDIO_STREAMS-audio.mp4"
+    printf 'valid clip\n' >"$clip"
+    : >"$FAKE_FFMPEG_LOG"
+    run_capture "$BASH_BIN" "$CLI" saved "$clip" replay
+    assert_eq 0 "$CAPTURE_STATUS" "callback rejected a clip with $FAKE_FFPROBE_AUDIO_STREAMS audio streams"
+    [[ ! -s "$FAKE_FFMPEG_LOG" ]] || fail "callback unnecessarily remuxed a clip with at most one audio stream"
+  done
 }
 
 test_delayed_replay_archiving() {
@@ -706,12 +956,25 @@ test_delayed_replay_archiving() {
   local fresh_clip="$staging/fresh clip.mp4"
   local unavailable_clip="$staging/waits for disk.mp4"
 
+  FAKE_FFPROBE_AUDIO_STREAMS=1
+  export FAKE_FFPROBE_AUDIO_STREAMS
+  make_fake_ffprobe
+  make_fake_findmnt
+  FAKE_FINDMNT_ARCHIVE_PREFIX="$archive"
+  FAKE_FINDMNT_ARCHIVE_UUID=A1B2-C3D4
+  export FAKE_FINDMNT_ARCHIVE_PREFIX FAKE_FINDMNT_ARCHIVE_UUID
   mkdir -p "$staging" "$archive"
   printf 'new version\n' >"$old_clip"
   printf 'fresh\n' >"$fresh_clip"
   printf 'existing version\n' >"$archive/old clip.mp4"
   touch -d '31 minutes ago' "$old_clip"
   write_test_config screen 120 none false "$staging" disk 12345 '' "$archive" 1800
+  run_capture "$BASH_BIN" "$CLI" archive
+  assert_eq 1 "$CAPTURE_STATUS" "archive storage without a pinned filesystem UUID should be rejected"
+  assert_contains "$CAPTURE_OUTPUT" 'must have a required filesystem UUID' "missing archive UUID error is unclear"
+  [[ -e "$old_clip" ]] || fail "archive moved a clip without a pinned filesystem UUID"
+
+  write_test_config screen 120 none false "$staging" disk 12345 '' "$archive" 01800 A1B2-C3D4
 
   run_capture "$BASH_BIN" "$CLI" archive
   assert_eq 0 "$CAPTURE_STATUS" "archiving due replay clips failed: $CAPTURE_OUTPUT"
@@ -722,14 +985,250 @@ test_delayed_replay_archiving() {
 
   printf 'waiting\n' >"$unavailable_clip"
   touch -d '31 minutes ago' "$unavailable_clip"
-  make_fake_findmnt
-  FAKE_FINDMNT_UUID=FFFF-0000
-  export FAKE_FINDMNT_UUID
+  FAKE_FINDMNT_ARCHIVE_UUID=FFFF-0000
+  export FAKE_FINDMNT_ARCHIVE_UUID
   write_test_config screen 120 none false "$staging" disk 12345 '' "$archive" 1800 A1B2-C3D4
   run_capture "$BASH_BIN" "$CLI" archive
   assert_eq 0 "$CAPTURE_STATUS" "unavailable archive filesystem should be retried later"
   [[ -e "$unavailable_clip" ]] || fail "clip was deleted while archive filesystem was unavailable"
   [[ ! -e "$archive/waits for disk.mp4" ]] || fail "clip was archived to the wrong filesystem"
+}
+
+test_archive_recovers_idempotently() {
+  local staging="$CASE_DIR/staging" archive="$CASE_DIR/archive"
+  local source="$staging/clip.mp4" queued="$staging/queued.mp4"
+  local duplicate="$staging/duplicate.mp4" unsafe="$staging/unsafe.mp4"
+  local stale_part="$archive/.gsr-replay.abcd.part" outside="$CASE_DIR/outside.mp4"
+  local pending="$staging/.clip.mp4.gsr-replay-archive-pending"
+  local queued_pending="$staging/.queued.mp4.gsr-replay-archive-pending"
+  local unsafe_pending="$staging/.unsafe.mp4.gsr-replay-archive-pending"
+  local orphan_pending="$staging/.missing.mp4.gsr-replay-archive-pending"
+  local orphan_audio_pending="$staging/.missing.mp4.gsr-replay-audio-pending"
+  local archive_identity
+
+  FAKE_FFPROBE_AUDIO_STREAMS=1
+  export FAKE_FFPROBE_AUDIO_STREAMS
+  make_fake_ffprobe
+  make_fake_findmnt
+  FAKE_FINDMNT_ARCHIVE_PREFIX="$archive"
+  FAKE_FINDMNT_ARCHIVE_UUID=A1B2-C3D4
+  export FAKE_FINDMNT_ARCHIVE_PREFIX FAKE_FINDMNT_ARCHIVE_UUID
+  mkdir -p "$staging" "$archive"
+  printf 'new version\n' >"$source"
+  printf 'queued version\n' >"$queued"
+  printf 'same legitimate content\n' >"$duplicate"
+  printf 'unsafe marker content\n' >"$unsafe"
+  printf 'old version\n' >"$archive/clip.mp4"
+  cp "$source" "$archive/clip (1).mp4"
+  cp "$duplicate" "$archive/duplicate.mp4"
+  printf 'outside remains unchanged\n' >"$outside"
+  printf 'interrupted copy\n' >"$stale_part"
+  touch -d '31 minutes ago' "$source" "$queued" "$duplicate" "$unsafe"
+  archive_identity="$(printf '%s\n%s' "$(realpath -e -- "$archive")" 'a1b2-c3d4')"
+  printf '%s\0%s\0%s\0' "$(stat -c '%d:%i:%s:%y:%z' -- "$source")" 'clip (1).mp4' "$archive_identity" \
+    >"$pending"
+  printf '%s\0%s\0%s\0' "$(stat -c '%d:%i:%s:%y:%z' -- "$queued")" 'queued.mp4' "$archive_identity" \
+    >"$queued_pending"
+  printf '%s\0%s\0%s\0' "$(stat -c '%d:%i:%s:%y:%z' -- "$unsafe")" '../outside.mp4' "$archive_identity" \
+    >"$unsafe_pending"
+  printf 'orphaned transaction\n' >"$orphan_pending"
+  printf 'orphaned audio recovery\n' >"$orphan_audio_pending"
+  write_test_config screen 120 none false "$staging" disk 12345 '' "$archive" 1800 A1B2-C3D4
+
+  # Recovery of a published clip must succeed even when another copy cannot be
+  # written. Other clips still need their normal copy and collision handling.
+  FAKE_ARCHIVE_RECOVERED_SOURCE="$source"
+  FAKE_ARCHIVE_REAL_CP="$(command -v cp)"
+  export FAKE_ARCHIVE_RECOVERED_SOURCE FAKE_ARCHIVE_REAL_CP
+  cat >"$FAKE_BIN/cp" <<'EOF'
+#!/usr/bin/env bash
+for argument in "$@"; do
+  if [[ "$argument" == "$FAKE_ARCHIVE_RECOVERED_SOURCE" ]]; then
+    printf 'A redundant copy of the recovered clip cannot be written.\n' >&2
+    exit 1
+  fi
+done
+exec "$FAKE_ARCHIVE_REAL_CP" "$@"
+EOF
+  chmod +x "$FAKE_BIN/cp"
+
+  run_capture "$BASH_BIN" "$CLI" archive
+  assert_eq 0 "$CAPTURE_STATUS" "archive recovery failed: $CAPTURE_OUTPUT"
+  [[ ! -e "$source" ]] || fail "idempotent recovery left the staged clip behind"
+  [[ ! -e "$pending" ]] || fail "idempotent recovery left its transaction marker behind"
+  [[ ! -e "$stale_part" ]] || fail "archive recovery left a stale partial copy"
+  [[ ! -e "$archive/clip (2).mp4" ]] || fail "archive recovery duplicated an already copied collision"
+  [[ ! -e "$queued" && ! -e "$queued_pending" ]] || fail "pre-copy transaction recovery left staging state behind"
+  assert_eq 'queued version' "$(<"$archive/queued.mp4")" "pre-copy transaction recovery lost the queued clip"
+  [[ ! -e "$duplicate" ]] || fail "legitimate duplicate clip remained in staging"
+  assert_eq 'same legitimate content' "$(<"$archive/duplicate (1).mp4")" \
+    "an identical clip without a transaction marker was incorrectly discarded"
+  [[ ! -e "$unsafe" && ! -e "$unsafe_pending" ]] || fail "invalid transaction marker was not replaced safely"
+  assert_eq 'unsafe marker content' "$(<"$archive/unsafe.mp4")" "invalid marker recovery lost its source clip"
+  assert_eq 'outside remains unchanged' "$(<"$outside")" "invalid marker escaped the archive directory"
+  [[ ! -e "$orphan_pending" ]] || fail "orphaned archive transaction marker was not cleaned"
+  [[ ! -e "$orphan_audio_pending" ]] || fail "orphaned audio recovery marker was not cleaned"
+}
+
+test_archive_checks_source_and_continues() {
+  local staging="$CASE_DIR/staging" archive="$CASE_DIR/archive"
+  local first="$staging/first.mp4" second="$staging/second.mp4"
+
+  FAKE_FFPROBE_AUDIO_STREAMS=1
+  export FAKE_FFPROBE_AUDIO_STREAMS
+  make_fake_ffprobe
+  mkdir -p "$staging" "$archive"
+  printf 'first\n' >"$first"
+  printf 'second\n' >"$second"
+  touch -d '31 minutes ago' "$first" "$second"
+  make_fake_findmnt
+  FAKE_FINDMNT_SOURCE_PREFIX="$staging"
+  FAKE_FINDMNT_ARCHIVE_PREFIX="$archive"
+  FAKE_FINDMNT_SOURCE_UUID=WRONG
+  FAKE_FINDMNT_ARCHIVE_UUID=A1B2-C3D4
+  export FAKE_FINDMNT_SOURCE_PREFIX FAKE_FINDMNT_ARCHIVE_PREFIX FAKE_FINDMNT_SOURCE_UUID FAKE_FINDMNT_ARCHIVE_UUID
+  write_test_config screen 120 none false "$staging" disk 12345 CAFE-BABE "$archive" 1800 A1B2-C3D4
+
+  run_capture "$BASH_BIN" "$CLI" archive
+  assert_eq 0 "$CAPTURE_STATUS" "unavailable staging filesystem should be retried later"
+  [[ -e "$first" && -e "$second" ]] || fail "archive removed a clip from the wrong staging filesystem"
+  [[ ! -e "$archive/first.mp4" && ! -e "$archive/second.mp4" ]] || fail "archive copied from the wrong staging filesystem"
+
+  FAKE_FINDMNT_SOURCE_UUID=CAFE-BABE
+  export FAKE_FINDMNT_SOURCE_UUID
+  FAKE_FFPROBE_NO_VIDEO_FILE=first.mp4
+  export FAKE_FFPROBE_NO_VIDEO_FILE
+  run_capture "$BASH_BIN" "$CLI" archive
+  assert_eq 1 "$CAPTURE_STATUS" "one failed clip should make the archive run fail"
+  [[ -e "$first" ]] || fail "failed archive source was deleted"
+  [[ -f "$archive/second.mp4" ]] || fail "archive stopped before processing the later valid clip"
+}
+
+test_audio_failure_is_retried_before_archive() {
+  local staging="$CASE_DIR/staging" archive="$CASE_DIR/archive"
+  local clip="$CASE_DIR/staging/Replay_2026-08-13_10-00-00.mp4"
+  local restart_clip="$CASE_DIR/staging/Replay_2026-08-13_11-00-00.mp4"
+  local pending="$CASE_DIR/staging/.Replay_2026-08-13_10-00-00.mp4.gsr-replay-audio-pending"
+  local ffmpeg_log="$CASE_DIR/ffmpeg.log"
+
+  mkdir -p "$staging" "$archive"
+  printf 'two-track clip\n' >"$clip"
+  touch -d '31 minutes ago' "$clip"
+  FAKE_FFMPEG_LOG="$ffmpeg_log"
+  FAKE_FFMPEG_FAIL=true
+  export FAKE_FFMPEG_LOG FAKE_FFMPEG_FAIL
+  make_fake_ffmpeg
+  make_fake_findmnt
+  FAKE_FINDMNT_ARCHIVE_PREFIX="$archive"
+  FAKE_FINDMNT_ARCHIVE_UUID=A1B2-C3D4
+  export FAKE_FINDMNT_ARCHIVE_PREFIX FAKE_FINDMNT_ARCHIVE_UUID
+  write_test_config screen 120 default_output false "$staging" disk 12345 '' "$archive" 1800 A1B2-C3D4
+
+  run_capture "$BASH_BIN" "$CLI" saved "$clip" replay
+  assert_eq 1 "$CAPTURE_STATUS" "failed audio processing should fail the callback"
+  [[ -e "$clip" && -f "$pending" ]] || fail "failed audio processing did not leave recoverable state"
+  printf 'replacement bytes\n' >>"$clip"
+  touch -d '31 minutes ago' "$clip"
+  write_test_config screen 120 none false "$staging" disk 12345 '' "$archive" 1800 A1B2-C3D4
+
+  run_capture "$BASH_BIN" "$CLI" archive
+  assert_eq 1 "$CAPTURE_STATUS" "archive should not move a clip with failed audio processing"
+  [[ -e "$clip" && ! -e "$archive/$(basename -- "$clip")" ]] || fail "archive moved an unprocessed two-track clip"
+
+  FAKE_FFMPEG_FAIL=false
+  export FAKE_FFMPEG_FAIL
+  run_capture "$BASH_BIN" "$CLI" archive
+  assert_eq 0 "$CAPTURE_STATUS" "archive did not retry completed audio processing: $CAPTURE_OUTPUT"
+  [[ ! -e "$clip" && ! -e "$pending" ]] || fail "audio recovery left staging state behind"
+  [[ -f "$archive/$(basename -- "$clip")" ]] || fail "audio-recovered clip was not archived"
+
+  printf 'two-track clip saved before restart\n' >"$restart_clip"
+  touch -d '31 minutes ago' "$restart_clip"
+  run_capture "$BASH_BIN" "$CLI" archive
+  assert_eq 0 "$CAPTURE_STATUS" "archive did not recover a two-track clip without callback state: $CAPTURE_OUTPUT"
+  [[ ! -e "$restart_clip" ]] || fail "restart-recovered clip remained in staging"
+  [[ -f "$archive/$(basename -- "$restart_clip")" ]] || fail "restart-recovered clip was not archived"
+}
+
+test_save_requests_are_serialized() {
+  local systemctl_log="$CASE_DIR/systemctl.log" request_file="$XDG_CONFIG_HOME/gsr-replay/save-request-time"
+  local delayed_clip="$CASE_DIR/replays/Replay_2000-01-01_00-00-00.mp4" request_before
+
+  : >"$systemctl_log"
+  FAKE_SYSTEMCTL_LOG="$systemctl_log"
+  FAKE_SYSTEMCTL_STATE=active
+  export FAKE_SYSTEMCTL_LOG FAKE_SYSTEMCTL_STATE
+  make_fake_systemctl
+  install_expected_service
+  write_test_config screen 120 default_output false "$CASE_DIR/replays"
+
+  run_capture "$BASH_BIN" "$CLI" save
+  assert_eq 0 "$CAPTURE_STATUS" "first replay save request failed: $CAPTURE_OUTPUT"
+  [[ -f "$request_file" ]] || fail "first replay save did not persist request state"
+  run_capture "$BASH_BIN" "$CLI" save
+  assert_eq 1 "$CAPTURE_STATUS" "a second in-flight replay save should be rejected"
+  assert_contains "$CAPTURE_OUTPUT" 'already in progress' "duplicate save error is unclear"
+
+  FAKE_FFPROBE_AUDIO_STREAMS=1
+  export FAKE_FFPROBE_AUDIO_STREAMS
+  make_fake_ffprobe
+  printf 'delayed old callback\n' >"$delayed_clip"
+  request_before="$(<"$request_file")"
+  run_capture "$BASH_BIN" "$CLI" saved "$delayed_clip" replay
+  assert_eq 0 "$CAPTURE_STATUS" "delayed callback failed unexpectedly: $CAPTURE_OUTPUT"
+  assert_eq "$request_before" "$(<"$request_file")" "delayed callback consumed a newer save request"
+
+  rm -f -- "$request_file"
+  FAKE_SYSTEMCTL_KILL_FAIL=true
+  export FAKE_SYSTEMCTL_KILL_FAIL
+  run_capture "$BASH_BIN" "$CLI" save
+  assert_eq 1 "$CAPTURE_STATUS" "a failed recorder signal should fail the save command"
+  [[ ! -e "$request_file" ]] || fail "failed recorder signal left a blocking save request"
+}
+
+test_state_lock_symlinks_are_rejected() {
+  local staging="$CASE_DIR/staging" archive="$CASE_DIR/archive"
+  local clip="$staging/clip.mp4" target="$CASE_DIR/do-not-touch"
+
+  FAKE_FFPROBE_AUDIO_STREAMS=1
+  export FAKE_FFPROBE_AUDIO_STREAMS
+  make_fake_ffprobe
+  mkdir -p "$staging" "$archive" "$XDG_CONFIG_HOME/gsr-replay"
+  printf 'clip\n' >"$clip"
+  printf 'unchanged\n' >"$target"
+  touch -d '31 minutes ago' "$clip"
+  ln -s "$target" "$XDG_CONFIG_HOME/gsr-replay/archive.lock"
+  write_test_config screen 120 none false "$staging" disk 12345 '' "$archive" 1800 A1B2-C3D4
+
+  run_capture "$BASH_BIN" "$CLI" archive
+  assert_eq 1 "$CAPTURE_STATUS" "archive should reject a symlinked state lock"
+  assert_eq 'unchanged' "$(<"$target")" "archive lock handling modified the symlink target"
+  [[ -e "$clip" ]] || fail "archive moved a clip without acquiring its trusted lock"
+}
+
+test_auxiliary_units_are_validated() {
+  local overriding_timer="$CASE_DIR/override-archive.timer"
+
+  make_fake_systemctl
+  install_expected_service
+  write_test_config screen 120 none false "$CASE_DIR/replays"
+  FAKE_AUDIO_MONITOR_DROPINS="$CASE_DIR/audio-override.conf"
+  export FAKE_AUDIO_MONITOR_DROPINS
+  run_capture "$BASH_BIN" "$CLI" start
+  assert_eq 1 "$CAPTURE_STATUS" "an audio-monitor drop-in should block replay service control"
+  assert_contains "$CAPTURE_OUTPUT" 'loaded audio monitor service has unsupported drop-ins' \
+    "audio-monitor unit validation did not identify the override"
+
+  FAKE_AUDIO_MONITOR_DROPINS=""
+  FAKE_ARCHIVE_TIMER_FRAGMENT="$overriding_timer"
+  export FAKE_AUDIO_MONITOR_DROPINS FAKE_ARCHIVE_TIMER_FRAGMENT
+  printf '[Timer]\nOnCalendar=daily\n' >"$overriding_timer"
+  mkdir -p "$CASE_DIR/archive"
+  write_test_config screen 120 none false "$CASE_DIR/replays" disk 12345 '' "$CASE_DIR/archive" 1800 A1B2-C3D4
+  run_capture "$BASH_BIN" "$CLI" doctor
+  assert_eq 1 "$CAPTURE_STATUS" "doctor should reject a shadowing archive timer"
+  assert_contains "$CAPTURE_OUTPUT" "Loaded from $overriding_timer" \
+    "doctor did not identify the effective archive timer"
 }
 
 test_waybar_json() {
@@ -1383,12 +1882,14 @@ run_test() {
 }
 
 printf 'TAP version 13\n'
-printf '1..31\n'
+printf '1..40\n'
 run_test 'help and version commands' test_help_and_version
 run_test 'recorder argument construction and audio omission' test_recorder_arguments
+run_test 'NVIDIA encoder failures fall back without restart loops' test_nvidia_encoder_fallbacks
 run_test 'recorder captures separate desktop and microphone tracks' test_recorder_captures_separate_audio_tracks
 run_test 'portal recording restores its portal session' test_portal_recorder_arguments
 run_test 'config values are parsed as data without shell evaluation' test_config_values_are_data
+run_test 'configured output skips discovery and missing output keeps desktop defaults' test_output_directory_discovery
 run_test 'unsafe oversized RAM buffers are rejected' test_oversized_ram_config
 run_test 'required output filesystem UUID is enforced' test_required_output_filesystem
 run_test 'output verification and doctor enforce required storage' test_output_verification_and_doctor
@@ -1396,7 +1897,14 @@ run_test 'missing configuration blocks every start path' test_missing_config_blo
 run_test 'saving an active replay signals the recorder' test_save_active
 run_test 'saving an inactive replay starts the service' test_save_inactive
 run_test 'callback notifications respect file and config state' test_callback_notifications
+run_test 'combined media probes reject invalid clips without replacing originals' test_saved_media_validation
 run_test 'due replay clips move safely to archive storage' test_delayed_replay_archiving
+run_test 'archive recovery is idempotent and removes stale partial files' test_archive_recovers_idempotently
+run_test 'archive validates staging storage and continues after per-file errors' test_archive_checks_source_and_continues
+run_test 'failed audio finalization is retried before archiving' test_audio_failure_is_retried_before_archive
+run_test 'replay save requests are serialized' test_save_requests_are_serialized
+run_test 'state lock symlinks are rejected without touching their targets' test_state_lock_symlinks_are_rejected
+run_test 'auxiliary systemd units reject shadowing fragments and drop-ins' test_auxiliary_units_are_validated
 run_test 'Waybar emits valid active, inactive, and failed JSON' test_waybar_json
 run_test 'service control rejects a shadowing user unit' test_service_fragment_mismatch
 run_test 'service control rejects execution-changing drop-ins' test_service_dropin_mismatch

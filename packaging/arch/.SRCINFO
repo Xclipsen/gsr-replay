@@ -10,6 +10,7 @@ pkgbase = gsr-replay
 	depends = bash
 	depends = coreutils
 	depends = diffutils
+	depends = ffmpeg
 	depends = gpu-screen-recorder
 	depends = systemd
 	depends = util-linux

@@ -4,12 +4,26 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- Reduce status polling overhead by skipping unused video-directory discovery and JSON-escaping subprocesses.
+- Read media stream counts and duration together to halve FFprobe launches during audio finalization while preserving source and output validation.
+- Recover already-published archive transactions without copying the entire clip again, retaining content, source-identity, and filesystem checks before removing staging data.
 - Show the Waybar replay state as a red or gray dot and place it after the tray expander when available.
 - Add setup-managed, configurable Hyprland hotkeys for toggling and saving replays.
 - Capture desktop and microphone audio separately and mix the microphone only during headphone-active replay sections.
 - Track audio output changes with an event-driven systemd companion service.
 - Add optional delayed clip archiving from local staging to UUID-validated external storage.
 - Add archive destination and delay configuration to the setup wizard.
+- Make archiving restart-safe with verified, synchronized temporary copies and explicit per-clip transaction recovery.
+- Preserve and retry clips after interrupted audio finalization or archive copies.
+- Bind audio recovery state to the staged file and prevent delayed callbacks from consuming newer save requests.
+- Serialize save callbacks with archive runs and reject overlapping save requests.
+- Validate media streams and both staging and archive filesystems while continuing past per-file failures.
+- Pin archive storage during setup and fail closed instead of creating an external-drive path on the system disk.
+- Extend diagnostics to cover the archive timer, archive storage, and recovery dependencies.
+- Reject shadowed auxiliary systemd units, unsafe state-file symlinks, and archive path control bytes.
+- Keep Arch package metadata aligned with the FFmpeg runtime dependency.
+- Probe NVIDIA H.264 encoding at startup and fall back from NVENC to Vulkan GPU encoding, then CPU encoding, when an FFmpeg update raises the required NVENC API.
+- Prevent permanent encoder incompatibilities from entering a systemd restart loop.
 
 ## 1.1.0 - 2026-07-22
 

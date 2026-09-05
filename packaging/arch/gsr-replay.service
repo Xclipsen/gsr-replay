@@ -13,6 +13,7 @@ ExecStart=/usr/bin/gsr-replay run
 KillSignal=SIGINT
 TimeoutStopSec=30
 Restart=on-failure
+RestartPreventExitStatus=78
 RestartSec=5
 UMask=0077
 
